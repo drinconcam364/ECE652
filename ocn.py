@@ -34,7 +34,7 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ─── Global defaults ──────────────────────────────────────────────────────────
 
@@ -46,10 +46,15 @@ VC_FLIT_CAPACITY   = 8   # every VC holds up to this many flits
 DRAIN_ESCAPE_ENTRY_PROB           = 0.1
 TURN_RESTRICTED_ESCAPE_ENTRY_PROB = 0.1
 ESCAPE_ENTRY_PROB  = DRAIN_ESCAPE_ENTRY_PROB  # default for single-mesh runs
-DRAIN_PERIOD       = 500
+DRAIN_PERIOD       =  500
 DRAIN_WINDOW_HOPS  = 1
-FULL_DRAIN_EVERY_N_WINDOWS = 10   # perform a full drain once every N regular drain windows
-INJECTION_RATE     = 0.0005
+PRE_DRAIN_CYCLES   = 1 # FLITS_PER_PACKET # paper says -  maximum packet size supported in the networ
+FULL_DRAIN_EVERY_N_WINDOWS = 20   # perform a full drain once every N regular drain windows
+STRICT_REGULAR_DRAIN = False      # False = escape-first priority drain, True = escape-only regular drain
+INJECTION_RATE     = .025#0.006
+
+DRAIN_DEBUG_PRINTS = True
+DRAIN_DEBUG_PRINT_PERIOD = 200
 
 # ─── Chiplet type identifiers ─────────────────────────────────────────────────
 
@@ -85,6 +90,11 @@ ROUTING_RANDOM_ADAPTIVE_TR = "RANDOM_ADAPTIVE_TR"
 # - Normal VCs use fully random adaptive minimal routing.
 # - Escape VC uses turn-restricted adaptive routing (West-First).
 # - Packets may enter escape VC probabilistically and cannot return.
+
+DRAIN_MODE_NORMAL = "NORMAL"
+DRAIN_MODE_PRE_DRAIN = "PRE_DRAIN"
+DRAIN_MODE_DRAIN = "DRAIN"
+DRAIN_MODE_FULL_DRAIN = "FULL_DRAIN"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -607,28 +617,28 @@ class Chiplet:
         rng:         random.Random,
     ) -> Optional[Packet]:
         """
-        Try to inject a packet through one of this chiplet's boundary routers
-        (chosen at random for load balancing).
-        Returns the Packet on success, None if all boundary-router VCs are full.
+        Legacy helper that constructs a packet anchored to one source BR.
+
+        The current simulator injects directly in
+        ``InterposerMesh.inject_random_packets()`` by writing flits into the
+        attached interposer router's ``Down`` input-port VCs. Boundary routers
+        no longer hold outbound VC state, so this helper does not enqueue.
         """
         if not self.boundary_routers:
             return None
 
         brs = list(self.boundary_routers)
         rng.shuffle(brs)
-        for br in brs:
-            packet = Packet(
-                packet_id=packet_id,
-                src_chiplet=self.name,
-                dst_chiplet=dst_chiplet,
-                src_boundary_router=br.router_id,
-                dst_boundary_router=dst_br_id,
-                created_cycle=cycle,
-                current_node=br.router_id,
-            )
-            if br.inject_packet(packet, rng=rng):
-                return packet
-        return None   # all boundary routers full
+        br = brs[0]
+        return Packet(
+            packet_id=packet_id,
+            src_chiplet=self.name,
+            dst_chiplet=dst_chiplet,
+            src_boundary_router=br.router_id,
+            dst_boundary_router=dst_br_id,
+            created_cycle=cycle,
+            current_node=br.router_id,
+        )
 
     # ── packet reception ──────────────────────────────────────────────────────
 
@@ -762,6 +772,8 @@ class InterposerMesh:
         escape_entry_prob: float            = ESCAPE_ENTRY_PROB,
         drain_period:      int              = DRAIN_PERIOD,
         drain_window_hops: int              = DRAIN_WINDOW_HOPS,
+        full_drain_every_n_windows: int     = FULL_DRAIN_EVERY_N_WINDOWS,
+        pre_drain_cycles:  int              = PRE_DRAIN_CYCLES,
         cpu_injection_rate: float           = CPU_INJECTION_RATE,
         gpu_burst_rate:    float            = GPU_BURST_RATE,
         gpu_quiet_rate:    float            = GPU_QUIET_RATE,
@@ -776,6 +788,11 @@ class InterposerMesh:
         self.escape_entry_prob: float = max(0.0, min(1.0, escape_entry_prob))
         self.drain_period:      int   = max(1, drain_period)
         self.drain_window_hops: int   = max(1, drain_window_hops)
+        self.full_drain_every_n_windows: int = max(1, full_drain_every_n_windows)
+        self.pre_drain_cycles:  int   = max(0, pre_drain_cycles)
+        self._drain_mode: str = DRAIN_MODE_NORMAL
+        self._freeze_escape_admission: bool = False
+        self._pre_drain_cycles_remaining: int = 0
         self._drain_hops_remaining: int = 0
         self._drain_window_count:   int = 0   # number of regular drain windows fired so far
         self._full_drain_hops_remaining: int = 0  # >0 while a full drain is in progress
@@ -823,7 +840,11 @@ class InterposerMesh:
         # Unified ID counter: packet IDs and DRAIN-split flow IDs share one
         # namespace so they never collide.
         self._packet_counter:       int = 0
+        self._attempted_injections: int = 0
+        self._successful_injections: int = 0
         self._failed_injections:    int = 0   # attempted but dropped (all BRs full)
+        self._attempted_injections_by_type: Dict[str, int] = {}
+        self._successful_injections_by_type: Dict[str, int] = {}
 
         self._build_routers()
         self._build_links()
@@ -974,56 +995,210 @@ class InterposerMesh:
             return sorted(nodes)
         return path
 
-    def _drain_active(self) -> bool:
-        return self.drain_enabled and self._drain_hops_remaining > 0
-
-    def _perform_drain_hop(self) -> int:
+    def inject_faults(self, num_faults: int, rng: random.Random) -> List[Tuple[str, str]]:
         """
-        Move one escape-VC flit per router one hop along the offline DRAIN cycle.
+        Randomly disable ``num_faults`` bidirectional links on the interposer.
 
-        Per-port model: each router is searched across all input ports to find
-        the first port that has an escape flit.  That flit is moved to the next
-        router in the Hamiltonian cycle, entering the appropriate input port
-        (OPPOSITE of the output direction used).
+        Each fault removes one undirected edge by setting ``ir_neighbors`` to
+        ``None`` in both endpoint routers.  Afterwards the drain Hamiltonian
+        cycle is recomputed on the surviving topology so DRAIN windows can
+        still make progress wherever connectivity allows.
 
-        DRAIN split
-        -----------
-        If flits of the same flow_id remain in the source escape VC after the
-        head departs, they are assigned a fresh flow_id, the first is promoted
-        to a new worm head, and the source allocation is updated.
+        Parameters
+        ----------
+        num_faults : number of links to disable (clamped to available links).
+        rng        : seeded Random instance so fault placement is reproducible.
 
-        The moved flit always becomes a fresh solo worm at the destination.
+        Returns
+        -------
+        List of (rid_a, rid_b) pairs for the disabled edges.
+        """
+        # Collect all undirected edges once.
+        edges: List[Tuple[str, str, str]] = []  # (rid_a, rid_b, dir_a→b)
+        seen: set = set()
+        for rid, router in self.routers.items():
+            for direction, nid in router.ir_neighbors.items():
+                if nid is not None:
+                    key = tuple(sorted([rid, nid]))
+                    if key not in seen:
+                        seen.add(key)
+                        edges.append((rid, nid, direction))
+
+        num_faults = min(num_faults, len(edges))
+        if num_faults == 0:
+            return []
+
+        chosen_indices = rng.sample(range(len(edges)), num_faults)
+        disabled: List[Tuple[str, str]] = []
+        for i in chosen_indices:
+            rid_a, rid_b, dir_a = edges[i]
+            # Find the reverse direction.
+            dir_b = next(
+                d for d, n in self.routers[rid_b].ir_neighbors.items() if n == rid_a
+            )
+            self.routers[rid_a].ir_neighbors[dir_a] = None
+            self.routers[rid_b].ir_neighbors[dir_b] = None
+            disabled.append((rid_a, rid_b))
+
+        # Recompute drain cycle on the surviving topology.
+        self._drain_cycle = self._compute_drain_cycle()
+        self._drain_next = {
+            self._drain_cycle[i]: self._drain_cycle[(i + 1) % len(self._drain_cycle)]
+            for i in range(len(self._drain_cycle))
+        }
+        return disabled
+
+    def _drain_active(self) -> bool:
+        return self.drain_enabled and self._drain_mode in (
+            DRAIN_MODE_DRAIN,
+            DRAIN_MODE_FULL_DRAIN,
+        )
+
+    def _pre_drain_active(self) -> bool:
+        return self.drain_enabled and self._drain_mode == DRAIN_MODE_PRE_DRAIN
+
+    def _print_drain_debug(self, cycle: int, message: str, force: bool = False) -> None:
+        if DRAIN_DEBUG_PRINTS and (force or (cycle % max(1, DRAIN_DEBUG_PRINT_PERIOD) == 1)):
+            print(f"  cycle={cycle} mode={self._drain_mode} {message}")
+
+    def _set_drain_mode(self, mode: str) -> None:
+        """Update the drain FSM mode and whether new escape admissions are allowed."""
+        self._drain_mode = mode
+        self._freeze_escape_admission = mode != DRAIN_MODE_NORMAL
+
+    def _begin_pre_drain(self, cycle: int) -> None:
+        """
+        Enter PRE_DRAIN before the actual drain window begins.
+
+        In this model links are not represented with explicit in-flight state,
+        so PRE_DRAIN is implemented as a short period that freezes new escape-VC
+        admissions before the regular/full drain starts.
+        """
+        if not self.drain_enabled:
+            return
+        if self.pre_drain_cycles <= 0:
+            self._start_drain_window(cycle)
+            return
+        self._pre_drain_cycles_remaining = self.pre_drain_cycles
+        self._set_drain_mode(DRAIN_MODE_PRE_DRAIN)
+        self._print_drain_debug(
+            cycle,
+            f"enter pre_drain: freeze_escape_admission=1 cycles={self._pre_drain_cycles_remaining}",
+            force=True,
+        )
+
+    def _start_drain_window(self, cycle: int) -> None:
+        """Start either a regular DRAIN window or a periodic FULL_DRAIN window."""
+        if not self.drain_enabled:
+            return
+        self._drain_window_count += 1
+        if self._drain_window_count % self.full_drain_every_n_windows == 0:
+            self._full_drain_hops_remaining = len(self._drain_cycle)
+            self._drain_hops_remaining = 0
+            self._set_drain_mode(DRAIN_MODE_FULL_DRAIN)
+            self._print_drain_debug(
+                cycle,
+                f"enter full_drain: hops_remaining={self._full_drain_hops_remaining}",
+                force=True,
+            )
+        else:
+            self._drain_hops_remaining = self.drain_window_hops
+            self._set_drain_mode(DRAIN_MODE_DRAIN)
+            self._print_drain_debug(
+                cycle,
+                f"enter drain: hops_remaining={self._drain_hops_remaining}",
+                force=True,
+            )
+
+    def _advance_drain_fsm(self, cycle: int) -> None:
+        """Advance the drain scheduler once per cycle before flit movement."""
+        if not self.drain_enabled:
+            return
+
+        if self._drain_mode == DRAIN_MODE_PRE_DRAIN:
+            self._pre_drain_cycles_remaining -= 1
+            if self._pre_drain_cycles_remaining <= 0:
+                self._start_drain_window(cycle)
+            return
+
+        if self._drain_mode == DRAIN_MODE_DRAIN:
+            if self._drain_hops_remaining <= 0:
+                self._set_drain_mode(DRAIN_MODE_NORMAL)
+                self._print_drain_debug(cycle, "exit drain", force=True)
+            return
+
+        if self._drain_mode == DRAIN_MODE_FULL_DRAIN:
+            if self._full_drain_hops_remaining <= 0:
+                self._set_drain_mode(DRAIN_MODE_NORMAL)
+                self._print_drain_debug(cycle, "exit full_drain", force=True)
+            return
+
+        if cycle > 0 and cycle % self.drain_period == 0:
+            self._begin_pre_drain(cycle)
+
+    def _perform_regular_drain_hop(self, cycle: int) -> int:
+        """
+        Move escape-domain flits during a regular DRAIN window using
+        output-port arbitration.
+
+        Every input-port escape VC that has a head flit may request the router's
+        drain-path output port. At most one winner is selected per output port
+        (matching the normal forwarding model), then all winners are checked
+        against downstream escape-VC availability and committed simultaneously.
+
+        The current offline drain cycle assigns one drain-next router per
+        source router, so all escape requests within one router typically
+        contend for the same output port. This helper still removes the older
+        "first input port only" shortcut and keeps arbitration output-centric.
+        
+        
+        
         """
         if not self._drain_cycle:
             return 0
 
-        # For each router, find the first input port with an escape flit.
-        # candidates: list of (src_rid, port_name)
-        candidates: List[Tuple[str, str]] = []
-        for rid, router in self.routers.items():
-            for port_name, port in router.input_ports.items():
-                if port.has_escape_flit():
-                    candidates.append((rid, port_name))
-                    break   # one escape flit per router per DRAIN hop
-
-        if not candidates:
-            return 0
-
-        # Determine the input port at each destination.
-        # dst_port_name = OPPOSITE_DIR[out_dir] where out_dir = direction to drain-next.
-        will_depart_rids = {rid for rid, _ in candidates}
-        movable: List[Tuple[str, str, str, str]] = []   # (src, src_port, dst, dst_port)
-        for src_rid, src_port_name in candidates:
-            dst_rid  = self._drain_next[src_rid]
-            out_dir  = self._direction_to(src_rid, dst_rid)
+        # For each router input port that has an escape flit, build a request
+        # for that router's drain-path output port.
+        output_groups: Dict[Tuple[str, str], List[Tuple[str, str, str, str]]] = defaultdict(list)
+        candidate_count = 0
+        for src_rid, router in self.routers.items():
+            dst_rid = self._drain_next.get(src_rid)
+            if dst_rid is None:
+                continue
+            out_dir = self._direction_to(src_rid, dst_rid)
             if out_dir is None:
                 continue
             dst_port_name = self.OPPOSITE_DIR[out_dir]
+            for src_port_name, port in router.input_ports.items():
+                if not port.has_escape_flit():
+                    continue
+                output_groups[(src_rid, out_dir)].append(
+                    (src_rid, src_port_name, dst_rid, dst_port_name)
+                )
+                candidate_count += 1
+
+        if candidate_count == 0:
+            return 0
+
+        # Arbitrate one winner per output port.
+        winners: List[Tuple[str, str, str, str]] = []
+        for _output_key, candidates in output_groups.items():
+            winners.append(self._routing_rng.choice(candidates))
+
+        # Determine which winners can actually advance based on downstream
+        # escape-VC capacity/allocation.
+        # dst_port_name = OPPOSITE_DIR[out_dir] where out_dir = direction to drain-next.
+        will_depart_rids = {src_rid for src_rid, _, _, _ in winners}
+        movable: List[Tuple[str, str, str, str]] = []
+        for src_rid, src_port_name, dst_rid, dst_port_name in winners:
             dst_esc = self.routers[dst_rid].input_ports[dst_port_name].escape_vc
             # Account for a flit that may itself depart from dst this cycle.
-            projected_occ   = dst_esc.occupancy() - (1 if dst_rid in will_depart_rids else 0)
-            dst_free        = projected_occ < dst_esc.capacity
-            dst_free_alloc  = (dst_esc.allocated_flow_id is None or dst_rid in will_depart_rids)
+            projected_occ = dst_esc.occupancy() - (1 if dst_rid in will_depart_rids else 0)
+            dst_free = projected_occ < dst_esc.capacity
+            dst_free_alloc = (
+                dst_esc.allocated_flow_id is None
+                or dst_rid in will_depart_rids
+            )
             if dst_free and dst_free_alloc:
                 movable.append((src_rid, src_port_name, dst_rid, dst_port_name))
 
@@ -1037,8 +1212,8 @@ class InterposerMesh:
         moves = 0
         for src_rid, src_port_name, dst_rid, dst_port_name, flit in staged:
             src_router = self.routers[src_rid]
-            src_esc    = src_router.input_ports[src_port_name].escape_vc
-            old_flow   = flit.flow_id
+            src_esc = src_router.input_ports[src_port_name].escape_vc
+            old_flow = flit.flow_id
 
             # ── DRAIN split: remaining flits of same flow in source escape VC ─
             remaining = [f for f in src_esc.fifo_queue if f.flow_id == old_flow]
@@ -1053,8 +1228,8 @@ class InterposerMesh:
                 src_router.flow_output_table.pop(old_flow, None)
 
             # ── Moved flit becomes a fresh solo worm at the destination ────
-            new_flow_dst      = self._alloc_flow_id()
-            flit.flow_id      = new_flow_dst
+            new_flow_dst = self._alloc_flow_id()
+            flit.flow_id = new_flow_dst
             flit.is_worm_head = True
             flit.is_worm_tail = True
             flit.in_escape_vc = True
@@ -1065,6 +1240,14 @@ class InterposerMesh:
             if flit.flit_idx == 0:
                 flit.parent_packet.hops += 1
             moves += 1
+
+        blocked = candidate_count - len(movable)
+        self._print_drain_debug(
+            cycle,
+            f"regular_drain_hop: candidates={candidate_count} winners={len(winners)} "
+            f"forwarded={len(movable)} blocked={blocked}",
+            force = True
+        )
 
         return moves
 
@@ -1304,9 +1487,15 @@ class InterposerMesh:
           and ``_failed_injections`` is incremented.
 
         Returns the count of successfully injected packets this cycle.
-        During a full-drain window injection is suppressed.
+        During PRE_DRAIN and FULL_DRAIN, injection is suppressed.
         """
-        if self._full_drain_active():
+        pre_drain_starts_this_cycle = (
+            self.drain_enabled
+            and self._drain_mode == DRAIN_MODE_NORMAL
+            and cycle > 0
+            and cycle % self.drain_period == 0
+        )
+        if self._full_drain_active() or self._pre_drain_active() or pre_drain_starts_this_cycle:
             return 0
         chiplet_names = list(self.chiplets.keys())
         injected = 0
@@ -1314,6 +1503,10 @@ class InterposerMesh:
             rate = chiplet.current_injection_rate(cycle, rng)
             if rng.random() >= rate:
                 continue
+            self._attempted_injections += 1
+            self._attempted_injections_by_type[chiplet.chiplet_type] = (
+                self._attempted_injections_by_type.get(chiplet.chiplet_type, 0) + 1
+            )
             dst_name    = rng.choice([n for n in chiplet_names if n != src_name])
             dst_chiplet = self.chiplets[dst_name]
             if not dst_chiplet.boundary_routers:
@@ -1349,6 +1542,10 @@ class InterposerMesh:
                     target_vc.push(flit)
                 src_br.injected_packets.append(pkt)
                 injected += 1
+                self._successful_injections += 1
+                self._successful_injections_by_type[chiplet.chiplet_type] = (
+                    self._successful_injections_by_type.get(chiplet.chiplet_type, 0) + 1
+                )
                 success = True
                 break
 
@@ -1358,28 +1555,8 @@ class InterposerMesh:
 
     # ── DRAIN scheduling ──────────────────────────────────────────────────────
 
-    def trigger_drain(self) -> None:
-        """
-        Start a regular DRAIN window (escape-VC packets take one hop along the
-        offline Hamiltonian cycle).  Every FULL_DRAIN_EVERY_N_WINDOWS calls,
-        trigger a full drain instead: the entire Hamiltonian cycle is traversed
-        (one hop per cycle) so every escape-VC flit visits all routers and may
-        eject at its destination.  During a full drain, Phase 1 (injection) and
-        Phase 2b (normal-VC forwarding) are frozen.
-        """
-        if not self.drain_enabled:
-            return
-        self._drain_window_count += 1
-        if self._drain_window_count % FULL_DRAIN_EVERY_N_WINDOWS == 0:
-            # Full drain: needs len(drain_cycle) hops so every flit can visit
-            # every router and eject at its destination.
-            self._full_drain_hops_remaining = len(self._drain_cycle)
-            self._drain_hops_remaining = 0   # no regular drain this window
-        else:
-            self._drain_hops_remaining = self.drain_window_hops
-
     def _full_drain_active(self) -> bool:
-        return self.drain_enabled and self._full_drain_hops_remaining > 0
+        return self.drain_enabled and self._drain_mode == DRAIN_MODE_FULL_DRAIN
 
     # ── simulation step ───────────────────────────────────────────────────────
 
@@ -1416,16 +1593,17 @@ class InterposerMesh:
                     all ``FLITS_PER_PACKET`` flits have been ejected.
         """
         moves = 0
-        if self.drain_enabled and cycle > 0 and cycle % self.drain_period == 0:
-            self.trigger_drain()
+        self._advance_drain_fsm(cycle)
 
         # ── Full drain: freeze injection + normal-VC forwarding ───────────
         # During a full drain the Hamiltonian cycle runs one hop per cycle
         # until every escape-VC flit has visited all routers and can eject.
         if self._full_drain_active():
-            moves += self._perform_drain_hop()
+            hop_moves = self._perform_regular_drain_hop(cycle)
+            moves += hop_moves
             self._full_drain_hops_remaining -= 1
             # Eject escape flits sitting at their destination IR.
+            ejected = 0
             for rid, router in self.routers.items():
                 for port in router.input_ports.values():
                     flit = port.escape_vc.peek()
@@ -1442,13 +1620,26 @@ class InterposerMesh:
                             dst_br.receive_packet(pkt, cycle)
                             self.chiplets[dst_br.chiplet_name].receive_packet(pkt)
                         moves += 1
+                        ejected += 1
+            self._print_drain_debug(
+                cycle,
+                f"full_drain_step: hop_moves={hop_moves} ejected={ejected} hops_remaining={self._full_drain_hops_remaining}",
+                force=True
+            )
             return moves
 
         # ── Phase 2a: synchronized DRAIN circulation for escape VCs ───────
         drain_this_cycle = self._drain_active()
-        if drain_this_cycle:
-            moves += self._perform_drain_hop()
+        if drain_this_cycle and self._drain_mode == DRAIN_MODE_DRAIN:
+            moves += self._perform_regular_drain_hop(cycle)
             self._drain_hops_remaining -= 1
+            if STRICT_REGULAR_DRAIN:
+                self._print_drain_debug(
+                    cycle,
+                    "strict_regular_drain: normal forwarding skipped",
+                    force=True,
+                )
+                return moves
 
         # ── Phase 2b: per-port flit forwarding with output-port arbitration ─
         #
@@ -1485,6 +1676,9 @@ class InterposerMesh:
                     # ── Forward candidate ─────────────────────────────────
                     if flit.is_worm_head:
                         use_escape_next = is_escape_vc
+                        if self._pre_drain_active() and not use_escape_next:
+                            # PRE_DRAIN freezes new normal worm-head VC grabs.
+                            continue
                         nxt_rid = self.compute_next_hop_for_packet(
                             rid, dst_ir_id, is_escape=use_escape_next
                         )
@@ -1500,7 +1694,12 @@ class InterposerMesh:
                         # 1. Flip coin (or force if normal VC full).
                         # 2. If coin says escape but escape VC full → fall back to normal.
                         # 3. If both full → skip (retry next cycle).
-                        if not use_escape_next and self.escape_entry_prob > 0:
+                        allow_new_escape = not self._freeze_escape_admission
+                        if (
+                            allow_new_escape
+                            and not use_escape_next
+                            and self.escape_entry_prob > 0
+                        ):
                             normal_blocked = not nxt_port.can_accept(flit, use_escape=False)
                             want_escape    = (normal_blocked
                                              or self._routing_rng.random() < self.escape_entry_prob)
@@ -1519,6 +1718,8 @@ class InterposerMesh:
                         entry = router.flow_output_table.get(flit.flow_id)
                         if entry is None:
                             # Stranded by DRAIN split → promote to new worm head.
+                            if self._pre_drain_active() and not is_escape_vc:
+                                continue
                             flit.is_worm_head = True
                             flit.is_worm_tail = True
                             use_escape_next   = is_escape_vc
@@ -1602,51 +1803,107 @@ class InterposerMesh:
         return moves
 
     # ── topology queries ──────────────────────────────────────────────────────
-
+    # NOT used in the core simulation loop, but useful for testing, debugging, and statistics
     def get_router(self, row: int, col: int) -> InterposerRouter:
         return self.routers[self.router_id(row, col)]
 
-    def get_chiplet(self, row: int, col: int) -> Chiplet:
-        return self.chiplets[self.chiplet_name(row, col)]
+    def get_chiplet(self, chiplet_name: str) -> Chiplet:
+        return self.chiplets[chiplet_name]
 
-    def get_boundary_router(self, row: int, chip_col: int, br_idx: int = 0) -> BoundaryRouter:
-        return self.boundary_routers[self.br_id(row, chip_col, br_idx)]
+    def get_boundary_router(self, br_id: str) -> BoundaryRouter:
+        return self.boundary_routers[br_id]
 
     # ── network-wide statistics ───────────────────────────────────────────────
 
     def all_in_flight(self) -> int:
         """
-        Total flits currently inside the network (IRs + BR outbound queues).
+        Total flits currently buffered inside the network.
+
+        In the current model packets inject directly into interposer-router
+        input ports, so boundary routers no longer contribute outbound state.
         Divide by ``FLITS_PER_PACKET`` to get the packet-equivalent count.
         """
         total = 0
         for router in self.routers.values():
             total += router.total_occupancy()
-        for br in self.boundary_routers.values():
-            total += sum(vc.occupancy() for vc in br.normal_vcs)
         return total
 
-    def delivered_stats(self) -> Dict[str, float]:
-        """Aggregate latency and hop-count statistics across all delivered packets."""
-        total_injected  = sum(len(br.injected_packets) for br in self.boundary_routers.values())
+    def all_in_flight_packets_equiv(self) -> float:
+        """Packet-equivalent backlog derived from the flit backlog."""
+        return self.all_in_flight() / float(FLITS_PER_PACKET)
+
+    def _packet_stats(self, packets: List[Packet]) -> Dict[str, float]:
+        """Summarize latency and hop counts for a packet collection."""
         total_delivered = 0
         total_latency   = 0
         total_hops      = 0
-        for chiplet in self.chiplets.values():
-            for pkt in chiplet.received_packets:
-                total_delivered += 1
-                if pkt.delivered_cycle is not None:
-                    total_latency += pkt.delivered_cycle - pkt.created_cycle
-                total_hops += pkt.hops
+        for pkt in packets:
+            total_delivered += 1
+            if pkt.delivered_cycle is not None:
+                total_latency += pkt.delivered_cycle - pkt.created_cycle
+            total_hops += pkt.hops
         avg_lat  = total_latency / total_delivered if total_delivered else 0.0
         avg_hops = total_hops    / total_delivered if total_delivered else 0.0
         return {
-            "injected":          total_injected,
-            "delivered":         total_delivered,
-            "failed_injections": self._failed_injections,
-            "avg_latency":       round(avg_lat,  2),
-            "avg_hops":          round(avg_hops, 2),
+            "delivered":   total_delivered,
+            "avg_latency": round(avg_lat, 2),
+            "avg_hops":    round(avg_hops, 2),
         }
+
+    def delivered_stats(self) -> Dict[str, float]:
+        """Aggregate injection, delivery, latency, and backlog statistics."""
+        delivered_packets = [
+            pkt
+            for chiplet in self.chiplets.values()
+            for pkt in chiplet.received_packets
+        ]
+        stats = self._packet_stats(delivered_packets)
+        acceptance_rate = (
+            self._successful_injections / self._attempted_injections
+            if self._attempted_injections
+            else 0.0
+        )
+        stats.update({
+            "attempted_injections": self._attempted_injections,
+            "injected": self._successful_injections,
+            "failed_injections": self._failed_injections,
+            "acceptance_rate": round(acceptance_rate, 4),
+            "in_flight_flits": self.all_in_flight(),
+            "in_flight_packets_equiv": round(self.all_in_flight_packets_equiv(), 4),
+        })
+        return stats
+
+    def delivered_stats_by_type(self) -> Dict[str, Dict[str, float]]:
+        """Aggregate stats by source chiplet type."""
+        packets_by_type: Dict[str, List[Packet]] = {}
+        chiplet_counts_by_type: Dict[str, int] = {}
+
+        for chiplet in self.chiplets.values():
+            chiplet_counts_by_type[chiplet.chiplet_type] = (
+                chiplet_counts_by_type.get(chiplet.chiplet_type, 0) + 1
+            )
+
+        for chiplet in self.chiplets.values():
+            for pkt in chiplet.received_packets:
+                src_type = self.chiplets[pkt.src_chiplet].chiplet_type
+                packets_by_type.setdefault(src_type, []).append(pkt)
+
+        all_types = set(chiplet_counts_by_type) | set(self._attempted_injections_by_type)
+        stats_by_type: Dict[str, Dict[str, float]] = {}
+        for chiplet_type in sorted(all_types):
+            attempted = self._attempted_injections_by_type.get(chiplet_type, 0)
+            injected = self._successful_injections_by_type.get(chiplet_type, 0)
+            acceptance_rate = injected / attempted if attempted else 0.0
+            type_stats = self._packet_stats(packets_by_type.get(chiplet_type, []))
+            type_stats.update({
+                "attempted_injections": attempted,
+                "injected": injected,
+                "failed_injections": attempted - injected,
+                "acceptance_rate": round(acceptance_rate, 4),
+                "chiplet_count": chiplet_counts_by_type.get(chiplet_type, 0),
+            })
+            stats_by_type[chiplet_type] = type_stats
+        return stats_by_type
 
     def __repr__(self) -> str:
         cpu_count = sum(1 for s in self.chiplet_specs if s.chiplet_type == CHIPLET_CPU)
@@ -1718,9 +1975,9 @@ class DeadlockDetector:
     ─────
         detector = DeadlockDetector()
         for cycle in range(total_cycles):
-            mesh.inject_random_packets(cycle, rate, rng)
-            moves  = mesh.step(cycle)
-            report = detector.check(mesh, cycle, moves)
+            mesh.inject_random_packets(cycle, rng)
+            mesh.step(cycle)
+            report = detector.check(mesh, cycle)
             if report.detected:
                 # handle / log / trigger DRAIN ...
     """
@@ -2002,7 +2259,7 @@ class DeadlockDetector:
 # Quick smoke-test
 # ═══════════════════════════════════════════════════════════════════════════════
 
-COOLDOWN_CYCLES = 5000   # injection-free cycles appended after each run
+COOLDOWN_CYCLES = 10000   # injection-free cycles appended after each run
 
 
 def run_simulation(
@@ -2016,8 +2273,10 @@ def run_simulation(
     turn_restricted_escape_entry_prob: float       = TURN_RESTRICTED_ESCAPE_ENTRY_PROB,
     drain_period:       int                        = DRAIN_PERIOD,
     drain_window_hops:  int                        = DRAIN_WINDOW_HOPS,
+    full_drain_every_n_windows: int               = FULL_DRAIN_EVERY_N_WINDOWS,
+    pre_drain_cycles:   int                        = PRE_DRAIN_CYCLES,
     verbose:            bool                       = False,
-) -> Dict[str, Tuple[Dict[str, float], DeadlockDetector]]:
+) -> Dict[str, Tuple[Dict[str, Any], DeadlockDetector]]:
     """
     Run routing-algorithm comparison scenarios for `cycles` cycles, followed
     by `cooldown_cycles` injection-free cycles so in-flight packets can drain.
@@ -2043,6 +2302,9 @@ def run_simulation(
                                         ``random_adaptive_turn_restricted``.
     drain_period       : DRAIN window triggered every N cycles.
     drain_window_hops  : Synchronized DRAIN hops per window.
+    full_drain_every_n_windows : Run a FULL_DRAIN once every N regular drain windows.
+    pre_drain_cycles   : Cycles spent freezing new escape admissions before a
+                         drain window begins.
     verbose            : Print a line each time a deadlock is detected.
 
     Returns
@@ -2052,7 +2314,7 @@ def run_simulation(
     if chiplet_specs is None:
         chiplet_specs = build_image_layout()
     effective_cpu_rate = CPU_INJECTION_RATE if cpu_injection_rate is None else cpu_injection_rate
-    results: Dict[str, Tuple[Dict[str, float], DeadlockDetector]] = {}
+    results: Dict[str, Tuple[Dict[str, Any], DeadlockDetector]] = {}
     if seed is None:
         seed = random.SystemRandom().randrange(1 << 32)
     if routing_seed is None:
@@ -2084,6 +2346,8 @@ def run_simulation(
             escape_entry_prob=scenario_escape_entry_prob,
             drain_period=drain_period,
             drain_window_hops=drain_window_hops,
+            full_drain_every_n_windows=full_drain_every_n_windows,
+            pre_drain_cycles=pre_drain_cycles,
             num_normal_vcs=scenario_num_vcs,
             cpu_injection_rate=effective_cpu_rate,
             gpu_burst_rate=4 * effective_cpu_rate,
@@ -2108,6 +2372,17 @@ def run_simulation(
             detector.check(mesh, cycle)
 
         stats = mesh.delivered_stats()
+        chiplet_count = max(1, len(mesh.chiplets))
+        stats["throughput"] = round(stats["delivered"] / (cycles * chiplet_count), 6)
+
+        per_type = mesh.delivered_stats_by_type()
+        for chiplet_type, type_stats in per_type.items():
+            type_chiplet_count = max(1, int(type_stats.get("chiplet_count", 0)))
+            type_stats["throughput"] = round(
+                type_stats["delivered"] / (cycles * type_chiplet_count), 6
+            )
+        stats["per_type"] = per_type
+
         injected_by_chiplet: Dict[str, int] = {name: 0 for name in mesh.chiplets.keys()}
         for br in mesh.boundary_routers.values():
             for pkt in br.injected_packets:
@@ -2151,7 +2426,11 @@ def sweep_injection_rates(
     turn_restricted_escape_entry_prob: float = TURN_RESTRICTED_ESCAPE_ENTRY_PROB,
     drain_period:       int   = DRAIN_PERIOD,
     drain_window_hops:  int   = DRAIN_WINDOW_HOPS,
+    full_drain_every_n_windows: int = FULL_DRAIN_EVERY_N_WINDOWS,
+    pre_drain_cycles:   int   = PRE_DRAIN_CYCLES,
     num_seeds:          int   = 5,
+    drain_period_c:     Optional[float] = 0.2,
+    drain_period_alpha: float           = 2.0,
 ) -> Dict[str, Dict[float, Dict[str, int]]]:
     """
     Sweep CPU INJECTION_RATE and collect packet counts per scenario.
@@ -2162,6 +2441,13 @@ def sweep_injection_rates(
 
     Each seed runs ``cycles`` injection cycles followed by ``cooldown_cycles``
     injection-free cycles so in-flight packets can finish.
+
+    drain_period_c     : If set, the drain period for the DRAIN scenario is
+                         computed as ``max(1, round(c / rate^alpha))`` at each
+                         rate point (steeper inverse: drain much more frequently
+                         at high load).  Set to None to use the fixed
+                         ``drain_period`` argument instead.
+    drain_period_alpha : Exponent for the inverse power law (default 2.0).
 
     Returns
     -------
@@ -2179,7 +2465,13 @@ def sweep_injection_rates(
     sweep: Dict[str, Dict[float, Dict[str, int]]] = {label: {} for label in SCENARIO_LABELS}
     total = len(rates)
     for idx, rate in enumerate(rates):
-        print(f"  rate={rate:.6f} ({idx + 1}/{total})", flush=True)
+        effective_drain_period = (
+            max(1, round(drain_period_c / (rate ** drain_period_alpha)))
+            if drain_period_c is not None
+            else drain_period
+        )
+        # effective_drain_period = drain_period
+        print(f"  rate={rate:.6f}, drain_period={effective_drain_period} ({idx + 1}/{total})", flush=True)
 
         # Accumulate totals across multiple seeds, then average.
         accum: Dict[str, Dict[str, float]] = {
@@ -2196,8 +2488,10 @@ def sweep_injection_rates(
                 routing_seed=routing_seed + seed_offset * 1000,
                 drain_escape_entry_prob=drain_escape_entry_prob,
                 turn_restricted_escape_entry_prob=turn_restricted_escape_entry_prob,
-                drain_period=drain_period,
+                drain_period=effective_drain_period,
                 drain_window_hops=drain_window_hops,
+                full_drain_every_n_windows=full_drain_every_n_windows,
+                pre_drain_cycles=pre_drain_cycles,
             )
             for label in SCENARIO_LABELS:
                 stats = results[label][0]
@@ -2225,6 +2519,8 @@ def sweep_drain_window(
     drain_period_max:   int   = 5000,
     drain_period_step:  int   = 100,
     drain_window_hops:  int   = DRAIN_WINDOW_HOPS,
+    full_drain_every_n_windows: int = FULL_DRAIN_EVERY_N_WINDOWS,
+    pre_drain_cycles:   int   = PRE_DRAIN_CYCLES,
     drain_escape_entry_prob: float = DRAIN_ESCAPE_ENTRY_PROB,
     seed:               int   = 42,
     routing_seed:       int   = 0,
@@ -2246,7 +2542,7 @@ def sweep_drain_window(
 
     for idx, period in enumerate(periods):
         print(f"  drain_period={period} ({idx + 1}/{total})", flush=True)
-        accum = {"injected": 0.0, "delivered": 0.0, "failed_injections": 0.0}
+        accum = {"injected": 0.0, "delivered": 0.0, "failed_injections": 0.0, "avg_latency": 0.0}
 
         for seed_offset in range(num_seeds):
             rng = random.Random(seed + seed_offset * 1000)
@@ -2258,6 +2554,8 @@ def sweep_drain_window(
                 escape_entry_prob=drain_escape_entry_prob,
                 drain_period=period,
                 drain_window_hops=drain_window_hops,
+                full_drain_every_n_windows=full_drain_every_n_windows,
+                pre_drain_cycles=pre_drain_cycles,
                 num_normal_vcs=NUM_NORMAL_VCS,
                 cpu_injection_rate=cpu_injection_rate,
                 gpu_burst_rate=4 * cpu_injection_rate,
@@ -2278,11 +2576,13 @@ def sweep_drain_window(
             accum["injected"]          += int(stats["injected"])
             accum["delivered"]         += int(stats["delivered"])
             accum["failed_injections"] += int(stats["failed_injections"])
+            accum["avg_latency"]       += float(stats["avg_latency"])
 
         result[period] = {
             "injected":          int(round(accum["injected"]          / num_seeds)),
             "delivered":         int(round(accum["delivered"]         / num_seeds)),
             "failed_injections": int(round(accum["failed_injections"] / num_seeds)),
+            "avg_latency":       accum["avg_latency"] / num_seeds,
         }
 
     return result
@@ -2306,20 +2606,161 @@ def plot_drain_window_sweep(
 
     matplotlib.rcParams.update({"font.size": 12})
 
-    periods   = sorted(result.keys())
-    injected  = [result[p]["injected"]  for p in periods]
-    delivered = [result[p]["delivered"] for p in periods]
+    periods     = sorted(result.keys())
+    injected    = [result[p]["injected"]    for p in periods]
+    delivered   = [result[p]["delivered"]   for p in periods]
+    avg_latency = [result[p].get("avg_latency", 0.0) for p in periods]
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(periods, injected,  marker="o", linewidth=2, color="steelblue",
-            label="Injected")
-    ax.plot(periods, delivered, marker="s", linewidth=2, linestyle="--",
-            color="darkorange", label="Delivered")
-    ax.set_xlabel("DRAIN Period (cycles between DRAIN windows)")
-    ax.set_ylabel("# Packets")
-    ax.set_title("Random Adaptive + DRAIN\nInjected & Delivered vs DRAIN Window Period")
-    ax.grid(True, linestyle="--", alpha=0.5)
-    ax.legend(fontsize=10)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 10), sharex=True)
+
+    ax1.plot(periods, injected,  marker="o", linewidth=2, color="steelblue",
+             label="Injected")
+    ax1.plot(periods, delivered, marker="s", linewidth=2, linestyle="--",
+             color="darkorange", label="Delivered")
+    ax1.set_ylabel("# Packets")
+    ax1.set_title("Random Adaptive + DRAIN\nInjected & Delivered vs DRAIN Window Period")
+    ax1.grid(True, linestyle="--", alpha=0.5)
+    ax1.legend(fontsize=10)
+
+    ax2.plot(periods, avg_latency, marker="^", linewidth=2, color="seagreen",
+             label="Avg Latency")
+    ax2.set_xlabel("DRAIN Period (cycles between DRAIN windows)")
+    ax2.set_ylabel("Avg Packet Latency (cycles)")
+    ax2.set_title("Average Latency vs DRAIN Window Period")
+    ax2.grid(True, linestyle="--", alpha=0.5)
+    ax2.legend(fontsize=10)
+
+    fig.tight_layout()
+
+    out_file = f"{out_prefix}.png"
+    fig.savefig(out_file, dpi=150)
+    print(f"  Saved: {out_file}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def sweep_full_drain_window(
+    chiplet_specs:      Optional[List[ChipletSpec]] = None,
+    cycles:             int   = 20000,
+    cooldown_cycles:    int   = COOLDOWN_CYCLES,
+    cpu_injection_rate: float = 0.01,
+    full_drain_every_values: Optional[List[int]] = None,
+    drain_period:       int   = DRAIN_PERIOD,
+    drain_window_hops:  int   = DRAIN_WINDOW_HOPS,
+    pre_drain_cycles:   int   = PRE_DRAIN_CYCLES,
+    drain_escape_entry_prob: float = DRAIN_ESCAPE_ENTRY_PROB,
+    seed:               int   = 42,
+    routing_seed:       int   = 0,
+    num_seeds:          int   = 3,
+) -> Dict[int, Dict[str, int]]:
+    """
+    Sweep FULL_DRAIN_EVERY_N_WINDOWS for the ``random_adaptive_with_drain``
+    scenario only.
+
+    Returns
+    -------
+    result[full_drain_every_n_windows] = {"injected": int, "delivered": int}
+    """
+    if chiplet_specs is None:
+        chiplet_specs = build_image_layout()
+    if full_drain_every_values is None:
+        full_drain_every_values = [5, 10, 20, 50]
+
+    values = [max(1, int(v)) for v in full_drain_every_values]
+    result: Dict[int, Dict[str, int]] = {}
+    total = len(values)
+
+    for idx, every_n in enumerate(values):
+        print(f"  full_drain_every_n_windows={every_n} ({idx + 1}/{total})", flush=True)
+        accum = {"injected": 0.0, "delivered": 0.0, "failed_injections": 0.0, "avg_latency": 0.0}
+
+        for seed_offset in range(num_seeds):
+            rng = random.Random(seed + seed_offset * 1000)
+            mesh = InterposerMesh(
+                chiplet_specs=chiplet_specs,
+                routing_mode=ROUTING_RANDOM_ADAPTIVE,
+                routing_seed=routing_seed + seed_offset * 1000,
+                drain_enabled=True,
+                escape_entry_prob=drain_escape_entry_prob,
+                drain_period=drain_period,
+                drain_window_hops=drain_window_hops,
+                full_drain_every_n_windows=every_n,
+                pre_drain_cycles=pre_drain_cycles,
+                num_normal_vcs=NUM_NORMAL_VCS,
+                cpu_injection_rate=cpu_injection_rate,
+                gpu_burst_rate=4 * cpu_injection_rate,
+                gpu_quiet_rate=cpu_injection_rate / 10.0,
+            )
+            detector = DeadlockDetector()
+
+            for cycle in range(cycles):
+                mesh.inject_random_packets(cycle, rng)
+                mesh.step(cycle)
+                detector.check(mesh, cycle)
+
+            for cycle in range(cycles, cycles + cooldown_cycles):
+                mesh.step(cycle)
+                detector.check(mesh, cycle)
+
+            stats = mesh.delivered_stats()
+            accum["injected"]          += int(stats["injected"])
+            accum["delivered"]         += int(stats["delivered"])
+            accum["failed_injections"] += int(stats["failed_injections"])
+            accum["avg_latency"]       += float(stats["avg_latency"])
+
+        result[every_n] = {
+            "injected":          int(round(accum["injected"]          / num_seeds)),
+            "delivered":         int(round(accum["delivered"]         / num_seeds)),
+            "failed_injections": int(round(accum["failed_injections"] / num_seeds)),
+            "avg_latency":       accum["avg_latency"] / num_seeds,
+        }
+
+    return result
+
+
+def plot_full_drain_window_sweep(
+    result:     Dict[int, Dict[str, int]],
+    out_prefix: str  = "full_drain_window_sweep",
+    show:       bool = True,
+) -> None:
+    """
+    Plot FULL_DRAIN_EVERY_N_WINDOWS vs # packets injected and # packets delivered
+    for the random_adaptive_with_drain scenario.
+    """
+    import os
+    import tempfile
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams.update({"font.size": 12})
+
+    values      = sorted(result.keys())
+    injected    = [result[v]["injected"]    for v in values]
+    delivered   = [result[v]["delivered"]   for v in values]
+    avg_latency = [result[v].get("avg_latency", 0.0) for v in values]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 10), sharex=True)
+
+    ax1.plot(values, injected,  marker="o", linewidth=2, color="steelblue",
+             label="Injected")
+    ax1.plot(values, delivered, marker="s", linewidth=2, linestyle="--",
+             color="darkorange", label="Delivered")
+    ax1.set_ylabel("# Packets")
+    ax1.set_title("Random Adaptive + DRAIN\nInjected & Delivered vs FULL_DRAIN_EVERY_N_WINDOWS")
+    ax1.grid(True, linestyle="--", alpha=0.5)
+    ax1.legend(fontsize=10)
+
+    ax2.plot(values, avg_latency, marker="^", linewidth=2, color="seagreen",
+             label="Avg Latency")
+    ax2.set_xlabel("FULL_DRAIN_EVERY_N_WINDOWS")
+    ax2.set_ylabel("Avg Packet Latency (cycles)")
+    ax2.set_title("Average Latency vs FULL_DRAIN_EVERY_N_WINDOWS")
+    ax2.grid(True, linestyle="--", alpha=0.5)
+    ax2.legend(fontsize=10)
+
     fig.tight_layout()
 
     out_file = f"{out_prefix}.png"
@@ -2340,6 +2781,7 @@ def sweep_escape_prob(
     prob_step:           float = 0.05,
     drain_period:        int   = DRAIN_PERIOD,
     drain_window_hops:   int   = DRAIN_WINDOW_HOPS,
+    pre_drain_cycles:    int   = PRE_DRAIN_CYCLES,
     seed:                int   = 42,
     routing_seed:        int   = 0,
     num_seeds:           int   = 3,
@@ -2364,7 +2806,7 @@ def sweep_escape_prob(
 
     for idx, prob in enumerate(probs):
         print(f"  escape_entry_prob={prob:.2f} ({idx + 1}/{total})", flush=True)
-        accum = {"injected": 0.0, "delivered": 0.0, "failed_injections": 0.0}
+        accum = {"injected": 0.0, "delivered": 0.0, "failed_injections": 0.0, "avg_latency": 0.0}
 
         for seed_offset in range(num_seeds):
             rng = random.Random(seed + seed_offset * 1000)
@@ -2376,6 +2818,7 @@ def sweep_escape_prob(
                 escape_entry_prob=prob,
                 drain_period=drain_period,
                 drain_window_hops=drain_window_hops,
+                pre_drain_cycles=pre_drain_cycles,
                 num_normal_vcs=NUM_NORMAL_VCS,
                 cpu_injection_rate=cpu_injection_rate,
                 gpu_burst_rate=4 * cpu_injection_rate,
@@ -2396,11 +2839,13 @@ def sweep_escape_prob(
             accum["injected"]          += int(stats["injected"])
             accum["delivered"]         += int(stats["delivered"])
             accum["failed_injections"] += int(stats["failed_injections"])
+            accum["avg_latency"]       += float(stats["avg_latency"])
 
         result[prob] = {
             "injected":          int(round(accum["injected"]          / num_seeds)),
             "delivered":         int(round(accum["delivered"]         / num_seeds)),
             "failed_injections": int(round(accum["failed_injections"] / num_seeds)),
+            "avg_latency":       accum["avg_latency"] / num_seeds,
         }
 
     return result
@@ -2424,21 +2869,32 @@ def plot_escape_prob_sweep(
 
     matplotlib.rcParams.update({"font.size": 12})
 
-    probs     = sorted(result.keys())
-    injected  = [result[p]["injected"]  for p in probs]
-    delivered = [result[p]["delivered"] for p in probs]
+    probs       = sorted(result.keys())
+    injected    = [result[p]["injected"]    for p in probs]
+    delivered   = [result[p]["delivered"]   for p in probs]
+    avg_latency = [result[p].get("avg_latency", 0.0) for p in probs]
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(probs, injected,  marker="o", linewidth=2, color="steelblue",
-            label="Injected")
-    ax.plot(probs, delivered, marker="s", linewidth=2, linestyle="--",
-            color="darkorange", label="Delivered")
-    ax.set_xlabel("Escape Entry Probability")
-    ax.set_ylabel("# Packets")
-    ax.set_title("Random Adaptive + DRAIN\nInjected & Delivered vs Escape Entry Probability")
-    ax.set_xlim(-0.02, 1.02)
-    ax.grid(True, linestyle="--", alpha=0.5)
-    ax.legend(fontsize=10)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 10), sharex=True)
+
+    ax1.plot(probs, injected,  marker="o", linewidth=2, color="steelblue",
+             label="Injected")
+    ax1.plot(probs, delivered, marker="s", linewidth=2, linestyle="--",
+             color="darkorange", label="Delivered")
+    ax1.set_ylabel("# Packets")
+    ax1.set_title("Random Adaptive + DRAIN\nInjected & Delivered vs Escape Entry Probability")
+    ax1.set_xlim(-0.02, 1.02)
+    ax1.grid(True, linestyle="--", alpha=0.5)
+    ax1.legend(fontsize=10)
+
+    ax2.plot(probs, avg_latency, marker="^", linewidth=2, color="seagreen",
+             label="Avg Latency")
+    ax2.set_xlabel("Escape Entry Probability")
+    ax2.set_ylabel("Avg Packet Latency (cycles)")
+    ax2.set_title("Average Latency vs Escape Entry Probability")
+    ax2.set_xlim(-0.02, 1.02)
+    ax2.grid(True, linestyle="--", alpha=0.5)
+    ax2.legend(fontsize=10)
+
     fig.tight_layout()
 
     out_file = f"{out_prefix}.png"
@@ -2583,10 +3039,11 @@ def plot_injection_sweep(
         "random_adaptive_without_drain",
         "yx",
         "random_adaptive_turn_restricted",
+        "shortest_path",
     ]
     if all(label in sweep for label in combo_labels):
-        colors  = ["darkorange", "steelblue", "seagreen", "slategray"]
-        markers = ["o", "s", "^", "x"]
+        colors  = ["darkorange", "steelblue", "seagreen", "slategray", "firebrick"]
+        markers = ["o", "s", "^", "x", "D"]
         fig_inj, ax_inj = plt.subplots(figsize=(9, 6))
         fig_del, ax_del = plt.subplots(figsize=(9, 6))
         fig_fail, ax_fail = plt.subplots(figsize=(9, 6))
@@ -2710,6 +3167,216 @@ def plot_latency_sweep_all_scenarios(
     plt.close(fig)
 
 
+def sweep_fault_count(
+    chiplet_specs:       Optional[List[ChipletSpec]] = None,
+    fault_counts:        List[int]  = None,
+    cycles:              int   = 300_000,
+    cooldown_cycles:     int   = COOLDOWN_CYCLES,
+    cpu_injection_rate:  float = 0.002,
+    drain_period:        int   = 500,
+    drain_window_hops:   int   = DRAIN_WINDOW_HOPS,
+    pre_drain_cycles:    int   = PRE_DRAIN_CYCLES,
+    escape_entry_prob:   float = 0.1,
+    seed:                int   = 42,
+    routing_seed:        int   = 0,
+    num_seeds:           int   = 3,
+) -> Dict[str, Dict[int, Dict[str, float]]]:
+    """
+    Sweep number of randomly-injected link faults on the interposer mesh and
+    measure average packet latency (low-load regime).
+
+    Two fault-tolerant scenarios are tested:
+      - ``random_adaptive_with_drain``      (escape-VC + periodic DRAIN windows)
+      - ``random_adaptive_turn_restricted`` (West-First turn-restricted routing)
+
+    After each fault set is placed, the drain Hamiltonian cycle is recomputed
+    on the surviving topology so DRAIN windows can still make progress wherever
+    connectivity allows.  Adaptive routing automatically avoids severed links.
+
+    Parameters
+    ----------
+    fault_counts        : list of fault counts to sweep, e.g. [0, 1, 4, 8, 12].
+    cycles              : injection cycles per run (300 000 by default).
+    cooldown_cycles     : drain-only cycles after injection stops.
+    cpu_injection_rate  : per-cycle Bernoulli injection rate (low-load: 0.002).
+    drain_period        : cycles between DRAIN windows (500).
+    drain_window_hops   : escape-VC hops per DRAIN window.
+    pre_drain_cycles    : cycles spent freezing new escape admissions before a
+                          drain window begins.
+    escape_entry_prob   : probability a packet enters the escape VC per hop (0.1).
+    seed                : base RNG seed for traffic and fault placement.
+    routing_seed        : base RNG seed for routing decisions.
+    num_seeds           : independent seeds to average over.
+
+    Returns
+    -------
+    result[scenario][num_faults] = {
+        "avg_latency": float,
+        "delivered":   int,
+        "injected":    int,
+    }
+    """
+    if chiplet_specs is None:
+        chiplet_specs = build_image_layout()
+    if fault_counts is None:
+        fault_counts = [0, 1, 4, 8, 12]
+
+    scenarios = [
+        ("random_adaptive_with_drain",       ROUTING_RANDOM_ADAPTIVE,    True,  escape_entry_prob),
+        ("random_adaptive_turn_restricted",  ROUTING_RANDOM_ADAPTIVE_TR, False, escape_entry_prob),
+    ]
+
+    result: Dict[str, Dict[int, Dict[str, float]]] = {
+        label: {} for label, _, _, _ in scenarios
+    }
+    total = len(fault_counts) * len(scenarios)
+    done  = 0
+
+    for num_faults in fault_counts:
+        for label, routing_mode, drain_enabled, esc_prob in scenarios:
+            done += 1
+            print(
+                f"  fault_count={num_faults}, scenario={label} ({done}/{total})",
+                flush=True,
+            )
+            accum = {"injected": 0.0, "delivered": 0.0, "avg_latency": 0.0}
+
+            for seed_offset in range(num_seeds):
+                fault_rng   = random.Random(seed + seed_offset * 1000)
+                traffic_rng = random.Random(seed + seed_offset * 1000 + 1)
+
+                mesh = InterposerMesh(
+                    chiplet_specs=chiplet_specs,
+                    routing_mode=routing_mode,
+                    routing_seed=routing_seed + seed_offset * 1000,
+                    drain_enabled=drain_enabled,
+                    escape_entry_prob=esc_prob,
+                    drain_period=drain_period,
+                    drain_window_hops=drain_window_hops,
+                    pre_drain_cycles=pre_drain_cycles,
+                    num_normal_vcs=NUM_NORMAL_VCS,
+                    cpu_injection_rate=cpu_injection_rate,
+                    gpu_burst_rate=4 * cpu_injection_rate,
+                    gpu_quiet_rate=cpu_injection_rate / 10.0,
+                )
+
+                if num_faults > 0:
+                    mesh.inject_faults(num_faults, fault_rng)
+
+                detector = DeadlockDetector()
+
+                for cycle in range(cycles):
+                    mesh.inject_random_packets(cycle, traffic_rng)
+                    mesh.step(cycle)
+                    detector.check(mesh, cycle)
+
+                for cycle in range(cycles, cycles + cooldown_cycles):
+                    mesh.step(cycle)
+                    detector.check(mesh, cycle)
+
+                stats = mesh.delivered_stats()
+                accum["injected"]    += int(stats["injected"])
+                accum["delivered"]   += int(stats["delivered"])
+                accum["avg_latency"] += float(stats["avg_latency"])
+
+            result[label][num_faults] = {
+                "injected":    int(round(accum["injected"]    / num_seeds)),
+                "delivered":   int(round(accum["delivered"]   / num_seeds)),
+                "avg_latency": accum["avg_latency"] / num_seeds,
+            }
+
+    return result
+
+
+def plot_fault_sweep(
+    result:     Dict[str, Dict[int, Dict[str, float]]],
+    out_prefix: str  = "fault_sweep",
+    show:       bool = True,
+) -> None:
+    """
+    Plot number of faulty links vs average packet latency for the drain and
+    turn-restricted scenarios.
+
+    Outputs
+    -------
+    <out_prefix>_latency.png   – latency comparison for both scenarios
+    <out_prefix>_delivered.png – delivered packet count comparison
+    """
+    import os
+    import tempfile
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams.update({"font.size": 12})
+
+    scenario_style = {
+        "random_adaptive_with_drain": {
+            "label":  "Random Adaptive + DRAIN",
+            "color":  "darkorange",
+            "marker": "o",
+        },
+        "random_adaptive_turn_restricted": {
+            "label":  "Random Adaptive Turn-Restricted",
+            "color":  "steelblue",
+            "marker": "s",
+        },
+    }
+
+    # ── latency figure ────────────────────────────────────────────────────────
+    fig_lat, ax_lat = plt.subplots(figsize=(9, 6))
+    for scenario, style in scenario_style.items():
+        if scenario not in result:
+            continue
+        faults  = sorted(result[scenario].keys())
+        latency = [result[scenario][f]["avg_latency"] for f in faults]
+        ax_lat.plot(
+            faults, latency,
+            marker=style["marker"], linewidth=2, color=style["color"],
+            label=style["label"],
+        )
+    ax_lat.set_xlabel("Number of Faulty Links")
+    ax_lat.set_ylabel("Avg Packet Latency (cycles)")
+    ax_lat.set_title("Low-Load Avg Latency vs Number of Faulty Links\n"
+                     "(injection_rate=0.002, drain_period=500, escape_prob=0.1)")
+    ax_lat.grid(True, linestyle="--", alpha=0.5)
+    ax_lat.legend(fontsize=10)
+    fig_lat.tight_layout()
+    out_lat = f"{out_prefix}_latency.png"
+    fig_lat.savefig(out_lat, dpi=150)
+    print(f"  Saved: {out_lat}")
+    if show:
+        plt.show()
+    plt.close(fig_lat)
+
+    # ── delivered figure ──────────────────────────────────────────────────────
+    fig_del, ax_del = plt.subplots(figsize=(9, 6))
+    for scenario, style in scenario_style.items():
+        if scenario not in result:
+            continue
+        faults    = sorted(result[scenario].keys())
+        delivered = [result[scenario][f]["delivered"] for f in faults]
+        ax_del.plot(
+            faults, delivered,
+            marker=style["marker"], linewidth=2, color=style["color"],
+            label=style["label"],
+        )
+    ax_del.set_xlabel("Number of Faulty Links")
+    ax_del.set_ylabel("# Packets Delivered")
+    ax_del.set_title("Packets Delivered vs Number of Faulty Links\n"
+                     "(injection_rate=0.002, drain_period=500, escape_prob=0.1)")
+    ax_del.grid(True, linestyle="--", alpha=0.5)
+    ax_del.legend(fontsize=10)
+    fig_del.tight_layout()
+    out_del = f"{out_prefix}_delivered.png"
+    fig_del.savefig(out_del, dpi=150)
+    print(f"  Saved: {out_del}")
+    if show:
+        plt.show()
+    plt.close(fig_del)
+
+
 if __name__ == "__main__":
     LABELS = SCENARIO_LABELS
 
@@ -2732,43 +3399,61 @@ if __name__ == "__main__":
     #           f"avg_latency={stats['avg_latency']}  "
     #           f"avg_hops={stats['avg_hops']}  "
     #           f"failed_injections={stats['failed_injections']}")
-        # injected_by_chiplet = stats.get("injected_by_chiplet", {})
-        # if isinstance(injected_by_chiplet, dict):
-        #     print("  Injected by chiplet:")
-        #     for chiplet_name in sorted(injected_by_chiplet.keys()):
-        #         print(f"    {chiplet_name}: {injected_by_chiplet[chiplet_name]}")
-        # print(f"  {det.summary()}")
+    #     injected_by_chiplet = stats.get("injected_by_chiplet", {})
+    #     if isinstance(injected_by_chiplet, dict):
+    #         print("  Injected by chiplet:")
+    #         for chiplet_name in sorted(injected_by_chiplet.keys()):
+    #             print(f"    {chiplet_name}: {injected_by_chiplet[chiplet_name]}")
+    #     print(f"  {det.summary()}")
 
     print("Sweeping INJECTION_RATE from 0.05 to 0.50 (step 0.025, averaged over 5 seeds) ...")
     sweep = sweep_injection_rates(
         chiplet_specs=specs,
         cycles=20000,
-        rate_min=0.001,
+        rate_min=0.01,
         rate_max=0.031,
-        rate_step=0.003,
+        rate_step=0.005,
         seed=42,
         routing_seed=0,
-        num_seeds=5,
+        num_seeds=3,
     )
     print("Generating sweep plots ...")
     plot_injection_sweep(sweep, out_prefix="injection_rate_sweep", show=False)
     plot_latency_sweep_all_scenarios(sweep, out_prefix="injection_rate_sweep", show=False)
     print()
 
+
     # print("Sweeping DRAIN window period from 100 to 5000 (step 100) ...")
     # drain_sweep = sweep_drain_window(
     #     chiplet_specs=specs,
-    #     cycles=100_000,
-    #     cpu_injection_rate=0.01,
+    #     cycles=300000,
+    #     cpu_injection_rate=0.006,
     #     drain_period_min=0,
-    #     drain_period_max=5000,
-    #     drain_period_step=200,
+    #     drain_period_max=10000,
+    #     drain_period_step=1000,
     #     seed=42,
     #     routing_seed=0,
-    #     num_seeds=3,
+    #     num_seeds=5,
     # )
     # print("Generating DRAIN window sweep plot ...")
     # plot_drain_window_sweep(drain_sweep, out_prefix="drain_window_sweep", show=False)
+    # print()
+    
+    # print("Sweeping FULL_DRAIN_EVERY_N_WINDOWS")
+    # full_drain_sweep = sweep_full_drain_window(
+    #     chiplet_specs=specs,
+    #     cycles=200000,
+    #     cpu_injection_rate=0.01,
+    #     full_drain_every_values= [5, 10, 20, 50],
+    #     drain_period=80,
+    #     drain_window_hops=1,
+    #     pre_drain_cycles=2,
+    #     seed=42,
+    #     routing_seed=0,
+    #     num_seeds=2,
+    # )
+    # print("Generating FULL DRAIN window sweep plot ...")
+    # plot_full_drain_window_sweep(full_drain_sweep, out_prefix="full_drain_window_sweep", show=False)
     # print()
 
     # print("Sweeping drain_escape_entry_prob from 0.0 to 1.0 (step 0.05) ...")
@@ -2784,4 +3469,20 @@ if __name__ == "__main__":
     # )
     # print("Generating escape probability sweep plot ...")
     # plot_escape_prob_sweep(escape_prob_sweep, out_prefix="escape_prob_sweep", show=False)
+    # print()
+
+    # print("Sweeping faulty link counts [0, 1, 4, 8, 12] ...")
+    # fault_result = sweep_fault_count(
+    #     chiplet_specs=specs,
+    #     fault_counts=[0, 1, 2, 4, 6, 8, 12],
+    #     cycles=300000,
+    #     cpu_injection_rate=0.001,
+    #     drain_period=500,
+    #     escape_entry_prob=0.1,
+    #     seed=42,
+    #     routing_seed=0,
+    #     num_seeds=5,
+    # )
+    # print("Generating fault sweep plots ...")
+    # plot_fault_sweep(fault_result, out_prefix="fault_sweep", show=False)
     # print()
