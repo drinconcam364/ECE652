@@ -53,6 +53,8 @@ FULL_DRAIN_EVERY_N_WINDOWS = 20   # perform a full drain once every N regular dr
 STRICT_REGULAR_DRAIN = False      # False = escape-first priority drain, True = escape-only regular drain
 INJECTION_RATE     = .025#0.006
 
+COOLDOWN_CYCLES = 10000   # injection-free cycles appended after each run
+
 DRAIN_DEBUG_PRINTS = True
 DRAIN_DEBUG_PRINT_PERIOD = 200
 
@@ -96,6 +98,46 @@ DRAIN_MODE_PRE_DRAIN = "PRE_DRAIN"
 DRAIN_MODE_DRAIN = "DRAIN"
 DRAIN_MODE_FULL_DRAIN = "FULL_DRAIN"
 
+# ─── Protocol/message-class identifiers ──────────────────────────────────────
+
+MESSAGE_CLASS_REQ  = "REQ"
+MESSAGE_CLASS_RESP = "RESP"
+MESSAGE_CLASS_DATA = "DATA"
+MESSAGE_CLASS_CTRL = "CTRL"
+
+MESSAGE_CLASSES: Tuple[str, ...] = (
+    MESSAGE_CLASS_REQ,
+    MESSAGE_CLASS_RESP,
+    MESSAGE_CLASS_DATA,
+    MESSAGE_CLASS_CTRL,
+)
+
+PROTOCOL_SERVICE_ORDER: Tuple[str, ...] = (
+    MESSAGE_CLASS_RESP,
+    MESSAGE_CLASS_REQ,
+    MESSAGE_CLASS_DATA,
+    MESSAGE_CLASS_CTRL,
+)
+
+# Top-level switch for legacy vs protocol traffic generation.
+# False = legacy single-class traffic, True = REQ->RESP protocol traffic.
+PROTOCOL_MODE_ENABLED = True
+
+## iffy --
+PROTOCOL_INJECTION_QUEUE_CAPACITY_PER_CLASS = 32
+PROTOCOL_EJECTION_QUEUE_CAPACITY_PER_CLASS = 32
+PROTOCOL_OUTSTANDING_LIMIT_PER_CLASS: Dict[str, int] = {
+    MESSAGE_CLASS_REQ: 16,
+    MESSAGE_CLASS_RESP: 16,
+    MESSAGE_CLASS_DATA: 8,
+    MESSAGE_CLASS_CTRL: 8,
+}
+
+
+def _zero_message_class_map(default_value: int = 0) -> Dict[str, int]:
+    """Return a fresh per-message-class map."""
+    return {message_class: default_value for message_class in MESSAGE_CLASSES}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Chiplet specification
@@ -128,6 +170,68 @@ class ChipletSpec:
         if self.vc_capacity is not None:
             return self.vc_capacity
         return GPU_VC_CAPACITY if self.chiplet_type == CHIPLET_GPU else CPU_VC_CAPACITY
+
+
+@dataclass
+class ProtocolConfig:
+    """
+    Packet-level approximation of endpoint protocol queues and dependencies.
+
+    This intentionally models the DRAIN paper's protocol-deadlock concepts at a
+    coarse packet granularity rather than as hardware-accurate credit or
+    shift-register logic.
+    """
+
+    enabled: bool = PROTOCOL_MODE_ENABLED
+    injection_queue_capacity_per_class: int = PROTOCOL_INJECTION_QUEUE_CAPACITY_PER_CLASS
+    ejection_queue_capacity_per_class: int = PROTOCOL_EJECTION_QUEUE_CAPACITY_PER_CLASS
+    outstanding_limit_per_class: Dict[str, int] = field(
+        default_factory=lambda: dict(PROTOCOL_OUTSTANDING_LIMIT_PER_CLASS)
+    )
+    source_message_classes: Tuple[str, ...] = (MESSAGE_CLASS_REQ,)
+    sink_message_classes: Tuple[str, ...] = (MESSAGE_CLASS_RESP,)
+    service_order: Tuple[str, ...] = PROTOCOL_SERVICE_ORDER
+    request_generates_response: bool = True
+
+    def outstanding_limit(self, message_class: str) -> int:
+        """Return the configured outstanding packet limit for one class."""
+        return max(
+            0,
+            int(
+                self.outstanding_limit_per_class.get(
+                    message_class,
+                    self.injection_queue_capacity_per_class,
+                )
+            ),
+        )
+
+
+@dataclass
+class TransactionRecord:
+    """Track one REQ→RESP transaction in protocol mode."""
+
+    transaction_id: int
+    request_packet_id: int
+    request_created_cycle: int
+    request_src_chiplet: str
+    request_dst_chiplet: str
+    response_packet_id: Optional[int] = None
+    response_created_cycle: Optional[int] = None
+    completed_cycle: Optional[int] = None
+
+
+def build_default_protocol_config() -> ProtocolConfig:
+    """Construct a fresh protocol config from the top-level default variables."""
+    return ProtocolConfig(
+        enabled=PROTOCOL_MODE_ENABLED,
+        injection_queue_capacity_per_class=PROTOCOL_INJECTION_QUEUE_CAPACITY_PER_CLASS,
+        ejection_queue_capacity_per_class=PROTOCOL_EJECTION_QUEUE_CAPACITY_PER_CLASS,
+        outstanding_limit_per_class=dict(PROTOCOL_OUTSTANDING_LIMIT_PER_CLASS),
+        source_message_classes=(MESSAGE_CLASS_REQ,),
+        sink_message_classes=(MESSAGE_CLASS_RESP,),
+        service_order=PROTOCOL_SERVICE_ORDER,
+        request_generates_response=True,
+    )
 
 
 def build_image_layout() -> List[ChipletSpec]:
@@ -217,6 +321,9 @@ class Packet:
     hops:                int  = 0       # interposer hops taken by the header flit
     delivered_cycle:     Optional[int] = None
     flits_delivered:     int  = 0       # number of this packet's flits that have been ejected
+    message_class:       str  = MESSAGE_CLASS_REQ
+    transaction_id:      Optional[int] = None
+    request_packet_id:   Optional[int] = None
     flits:               List = field(default_factory=list)   # populated in __post_init__
 
     def __post_init__(self) -> None:
@@ -455,6 +562,17 @@ class BoundaryRouter:
         # Tracking
         self.injected_packets: List[Packet] = []   # all packets ever injected
         self.received_packets: List[Packet] = []   # all packets ever delivered
+        self.injected_packets_by_class: Dict[str, List[Packet]] = {
+            message_class: [] for message_class in MESSAGE_CLASSES
+        }
+        self.received_packets_by_class: Dict[str, List[Packet]] = {
+            message_class: [] for message_class in MESSAGE_CLASSES
+        }
+
+    def record_injected_packet(self, packet: Packet) -> None:
+        """Track one packet injection at this BR."""
+        self.injected_packets.append(packet)
+        self.injected_packets_by_class[packet.message_class].append(packet)
 
     # ── inbound (interposer → chiplet) ────────────────────────────────────────
 
@@ -463,6 +581,7 @@ class BoundaryRouter:
         packet.current_node    = self.router_id
         packet.delivered_cycle = cycle
         self.received_packets.append(packet)
+        self.received_packets_by_class[packet.message_class].append(packet)
 
     def __repr__(self) -> str:
         return (
@@ -587,6 +706,18 @@ class Chiplet:
 
         # All packets delivered to this chiplet
         self.received_packets: List[Packet] = []
+        self.received_packets_by_class: Dict[str, List[Packet]] = {
+            message_class: [] for message_class in MESSAGE_CLASSES
+        }
+
+        # Packet-level protocol queues.
+        self.injection_queues: Dict[str, List[Packet]] = {
+            message_class: [] for message_class in MESSAGE_CLASSES
+        }
+        self.ejection_queues: Dict[str, List[Packet]] = {
+            message_class: [] for message_class in MESSAGE_CLASSES
+        }
+        self.outstanding_packets_by_class: Dict[str, int] = _zero_message_class_map()
 
     # ── setup ─────────────────────────────────────────────────────────────────
 
@@ -644,6 +775,65 @@ class Chiplet:
 
     def receive_packet(self, packet: Packet) -> None:
         self.received_packets.append(packet)
+        self.received_packets_by_class[packet.message_class].append(packet)
+
+    def enqueue_injection_packet(self, packet: Packet, capacity: int) -> bool:
+        """Append a packet to the per-class source queue if space remains."""
+        queue = self.injection_queues[packet.message_class]
+        if len(queue) >= capacity:
+            return False
+        queue.append(packet)
+        return True
+
+    def peek_next_injection_packet(
+        self,
+        service_order: Tuple[str, ...] = PROTOCOL_SERVICE_ORDER,
+    ) -> Optional[Packet]:
+        """Return the highest-priority pending source packet, if any."""
+        for message_class in service_order:
+            queue = self.injection_queues[message_class]
+            if queue:
+                return queue[0]
+        return None
+
+    def pop_next_injection_packet(
+        self,
+        service_order: Tuple[str, ...] = PROTOCOL_SERVICE_ORDER,
+    ) -> Optional[Packet]:
+        """Pop the highest-priority pending source packet, if any."""
+        for message_class in service_order:
+            queue = self.injection_queues[message_class]
+            if queue:
+                return queue.pop(0)
+        return None
+
+    def can_accept_ejection_packet(
+        self,
+        message_class: str,
+        capacity: int,
+        reserved_slots: int = 0,
+    ) -> bool:
+        """
+        Check whether one more delivered packet may enter this class queue.
+
+        Reservations are counted separately so packets can eject flit-by-flit
+        once the class queue has committed to holding the completed packet.
+        """
+        return len(self.ejection_queues[message_class]) + reserved_slots < capacity
+
+    def enqueue_ejection_packet(self, packet: Packet) -> None:
+        """Append a fully ejected packet to the destination class queue."""
+        self.ejection_queues[packet.message_class].append(packet)
+
+    def peek_ejection_packet(self, message_class: str) -> Optional[Packet]:
+        """Inspect the oldest delivered packet for one message class."""
+        queue = self.ejection_queues[message_class]
+        return queue[0] if queue else None
+
+    def pop_ejection_packet(self, message_class: str) -> Optional[Packet]:
+        """Remove the oldest delivered packet for one message class."""
+        queue = self.ejection_queues[message_class]
+        return queue.pop(0) if queue else None
 
     # ── stats helpers ─────────────────────────────────────────────────────────
 
@@ -779,6 +969,7 @@ class InterposerMesh:
         gpu_quiet_rate:    float            = GPU_QUIET_RATE,
         gpu_burst_cycles:  int              = GPU_BURST_CYCLES,
         gpu_quiet_cycles:  int              = GPU_QUIET_CYCLES,
+        protocol_config:   Optional[ProtocolConfig] = None,
     ) -> None:
         self.rows:             int  = rows
         self.cols:             int  = cols
@@ -801,6 +992,9 @@ class InterposerMesh:
         self.gpu_quiet_rate:     float = gpu_quiet_rate
         self.gpu_burst_cycles:   int   = gpu_burst_cycles
         self.gpu_quiet_cycles:   int   = gpu_quiet_cycles
+        self.protocol_config: ProtocolConfig = (
+            protocol_config if protocol_config is not None else ProtocolConfig()
+        )
 
         # Default: image-layout (4 corner GPUs + 1 central CPU)
         if chiplet_specs is None:
@@ -840,15 +1034,30 @@ class InterposerMesh:
         # Unified ID counter: packet IDs and DRAIN-split flow IDs share one
         # namespace so they never collide.
         self._packet_counter:       int = 0
+        self._transaction_counter:  int = 0
         self._attempted_injections: int = 0
         self._successful_injections: int = 0
         self._failed_injections:    int = 0   # attempted but dropped (all BRs full)
         self._attempted_injections_by_type: Dict[str, int] = {}
         self._successful_injections_by_type: Dict[str, int] = {}
+        self._failed_injections_by_type: Dict[str, int] = {}
+        self._attempted_injections_by_message_class: Dict[str, int] = _zero_message_class_map()
+        self._successful_injections_by_message_class: Dict[str, int] = _zero_message_class_map()
+        self._failed_injections_by_message_class: Dict[str, int] = _zero_message_class_map()
+        self._transactions_started: int = 0
+        self._transactions_completed: int = 0
+        self._completed_transaction_latency_total: int = 0
+        self._transaction_records: Dict[int, TransactionRecord] = {}
+        self._packet_ejection_reservations: Dict[int, str] = {}
+        self._reserved_ejection_slots: Dict[str, Dict[str, int]] = {}
 
         self._build_routers()
         self._build_links()
         self._attach_chiplets()
+        self._reserved_ejection_slots = {
+            chiplet_name: _zero_message_class_map()
+            for chiplet_name in self.chiplets.keys()
+        }
         self._drain_cycle: List[str] = self._compute_drain_cycle()
         self._drain_next: Dict[str, str] = {
             self._drain_cycle[i]: self._drain_cycle[(i + 1) % len(self._drain_cycle)]
@@ -1469,25 +1678,343 @@ class InterposerMesh:
         """Allocate a fresh flow ID for DRAIN-split sub-worms."""
         return self._next_packet_id()
 
-    def inject_random_packets(
+    def _next_transaction_id(self) -> int:
+        """Allocate a fresh protocol transaction ID."""
+        txn_id = self._transaction_counter
+        self._transaction_counter += 1
+        return txn_id
+
+    def _protocol_enabled(self) -> bool:
+        return self.protocol_config.enabled
+
+    def _record_packet_attempt(self, packet: Packet) -> None:
+        """Account for one newly offered packet before network injection."""
+        src_type = self.chiplets[packet.src_chiplet].chiplet_type
+        self._attempted_injections += 1
+        self._attempted_injections_by_type[src_type] = (
+            self._attempted_injections_by_type.get(src_type, 0) + 1
+        )
+        self._attempted_injections_by_message_class[packet.message_class] += 1
+
+    def _record_packet_drop(self, packet: Packet) -> None:
+        """Account for one packet offer rejected before entering the network."""
+        src_type = self.chiplets[packet.src_chiplet].chiplet_type
+        self._failed_injections += 1
+        self._failed_injections_by_type[src_type] = (
+            self._failed_injections_by_type.get(src_type, 0) + 1
+        )
+        self._failed_injections_by_message_class[packet.message_class] += 1
+
+    def _record_packet_network_injection(self, packet: Packet) -> None:
+        """Account for one packet entering the interposer network."""
+        src_type = self.chiplets[packet.src_chiplet].chiplet_type
+        self._successful_injections += 1
+        self._successful_injections_by_type[src_type] = (
+            self._successful_injections_by_type.get(src_type, 0) + 1
+        )
+        self._successful_injections_by_message_class[packet.message_class] += 1
+
+    def _build_packet(
+        self,
+        src_chiplet: str,
+        dst_chiplet: str,
+        cycle: int,
+        rng: random.Random,
+        message_class: str = MESSAGE_CLASS_REQ,
+        transaction_id: Optional[int] = None,
+        request_packet_id: Optional[int] = None,
+        src_boundary_router: Optional[str] = None,
+        dst_boundary_router: Optional[str] = None,
+    ) -> Optional[Packet]:
+        """Construct a packet and choose default boundary routers if needed."""
+        src_chiplet_obj = self.chiplets[src_chiplet]
+        dst_chiplet_obj = self.chiplets[dst_chiplet]
+        if not src_chiplet_obj.boundary_routers or not dst_chiplet_obj.boundary_routers:
+            return None
+
+        if src_boundary_router is None:
+            src_boundary_router = rng.choice(src_chiplet_obj.boundary_routers).router_id
+        if dst_boundary_router is None:
+            dst_boundary_router = rng.choice(dst_chiplet_obj.boundary_routers).router_id
+
+        return Packet(
+            packet_id=self._next_packet_id(),
+            src_chiplet=src_chiplet,
+            dst_chiplet=dst_chiplet,
+            src_boundary_router=src_boundary_router,
+            dst_boundary_router=dst_boundary_router,
+            created_cycle=cycle,
+            current_node=src_boundary_router,
+            message_class=message_class,
+            transaction_id=transaction_id,
+            request_packet_id=request_packet_id,
+        )
+
+    def _candidate_source_brs(
+        self,
+        packet: Packet,
+        rng: random.Random,
+    ) -> List[BoundaryRouter]:
+        """Order candidate source BRs, preferring the packet's assigned BR."""
+        chiplet = self.chiplets[packet.src_chiplet]
+        ordered: List[BoundaryRouter] = []
+        preferred = packet.src_boundary_router
+        for br in chiplet.boundary_routers:
+            if br.router_id == preferred:
+                ordered.append(br)
+                break
+
+        others = [br for br in chiplet.boundary_routers if br.router_id != preferred]
+        rng.shuffle(others)
+        ordered.extend(others)
+        return ordered
+
+    def _can_accept_protocol_source_packet(
+        self,
+        src_chiplet: str,
+        message_class: str,
+    ) -> bool:
+        """Check queue capacity and per-class outstanding limits."""
+        chiplet = self.chiplets[src_chiplet]
+        queue = chiplet.injection_queues[message_class]
+        if len(queue) >= self.protocol_config.injection_queue_capacity_per_class:
+            return False
+        outstanding_limit = self.protocol_config.outstanding_limit(message_class)
+        if chiplet.outstanding_packets_by_class[message_class] >= outstanding_limit:
+            return False
+        return True
+
+    def _enqueue_protocol_source_packet(self, packet: Packet) -> bool:
+        """Place a new packet into a source chiplet's per-class injection queue."""
+        chiplet = self.chiplets[packet.src_chiplet]
+        ok = chiplet.enqueue_injection_packet(
+            packet,
+            self.protocol_config.injection_queue_capacity_per_class,
+        )
+        if ok:
+            chiplet.outstanding_packets_by_class[packet.message_class] += 1
+        return ok
+
+    def _mark_packet_delivered(self, packet: Packet) -> None:
+        """Release one outstanding packet slot at the source chiplet."""
+        src_chiplet = self.chiplets[packet.src_chiplet]
+        current = src_chiplet.outstanding_packets_by_class.get(packet.message_class, 0)
+        src_chiplet.outstanding_packets_by_class[packet.message_class] = max(0, current - 1)
+
+    def _can_start_packet_ejection(self, packet: Packet) -> bool:
+        """
+        Check whether the destination chiplet can accept this packet's ejection.
+
+        The queue reservation is packet-level, which is a deliberate
+        approximation of endpoint flow control rather than a flit-credit model.
+        """
+        if not self._protocol_enabled():
+            return True
+        if packet.packet_id in self._packet_ejection_reservations:
+            return True
+        if packet.flits_delivered != 0:
+            return False
+
+        dst_chiplet = self.chiplets[packet.dst_chiplet]
+        reserved_slots = self._reserved_ejection_slots[packet.dst_chiplet][packet.message_class]
+        return dst_chiplet.can_accept_ejection_packet(
+            packet.message_class,
+            self.protocol_config.ejection_queue_capacity_per_class,
+            reserved_slots=reserved_slots,
+        )
+
+    def _reserve_packet_ejection(self, packet: Packet) -> bool:
+        """Reserve one destination queue slot for a packet before first ejection."""
+        if not self._protocol_enabled():
+            return True
+        if packet.packet_id in self._packet_ejection_reservations:
+            return True
+        if not self._can_start_packet_ejection(packet):
+            return False
+
+        self._packet_ejection_reservations[packet.packet_id] = packet.dst_chiplet
+        self._reserved_ejection_slots[packet.dst_chiplet][packet.message_class] += 1
+        return True
+
+    def _finalize_packet_delivery(self, packet: Packet, cycle: int) -> None:
+        """
+        Complete packet ejection into the destination endpoint model.
+
+        In protocol mode the packet is first placed in a per-class ejection
+        queue, then consumed later according to protocol rules.
+        """
+        dst_br_id = packet.dst_boundary_router
+        dst_br = self.boundary_routers[dst_br_id]
+        dst_chiplet = self.chiplets[dst_br.chiplet_name]
+
+        dst_br.receive_packet(packet, cycle)
+        if self._protocol_enabled():
+            reserved_owner = self._packet_ejection_reservations.pop(packet.packet_id, None)
+            if reserved_owner is not None:
+                self._reserved_ejection_slots[reserved_owner][packet.message_class] = max(
+                    0,
+                    self._reserved_ejection_slots[reserved_owner][packet.message_class] - 1,
+                )
+            dst_chiplet.enqueue_ejection_packet(packet)
+        dst_chiplet.receive_packet(packet)
+        self._mark_packet_delivered(packet)
+
+    def _generate_protocol_request_traffic(
         self,
         cycle: int,
-        rng:   random.Random,
-    ) -> int:
+        rng: random.Random,
+    ) -> None:
+        """Create external REQ packets and queue them at their source chiplets."""
+        chiplet_names = list(self.chiplets.keys())
+        for src_name, chiplet in self.chiplets.items():
+            rate = chiplet.current_injection_rate(cycle, rng)
+            if rng.random() >= rate:
+                continue
+
+            dst_name = rng.choice([name for name in chiplet_names if name != src_name])
+            transaction_id = self._next_transaction_id()
+            pkt = self._build_packet(
+                src_chiplet=src_name,
+                dst_chiplet=dst_name,
+                cycle=cycle,
+                rng=rng,
+                message_class=MESSAGE_CLASS_REQ,
+                transaction_id=transaction_id,
+            )
+            if pkt is None:
+                continue
+
+            self._record_packet_attempt(pkt)
+            if not self._can_accept_protocol_source_packet(src_name, pkt.message_class):
+                self._record_packet_drop(pkt)
+                continue
+            if not self._enqueue_protocol_source_packet(pkt):
+                self._record_packet_drop(pkt)
+                continue
+
+            self._transactions_started += 1
+            self._transaction_records[transaction_id] = TransactionRecord(
+                transaction_id=transaction_id,
+                request_packet_id=pkt.packet_id,
+                request_created_cycle=cycle,
+                request_src_chiplet=src_name,
+                request_dst_chiplet=dst_name,
+            )
+
+    def _try_generate_response_for_request(
+        self,
+        request_packet: Packet,
+        cycle: int,
+        rng: random.Random,
+    ) -> bool:
+        """Create a RESP packet when a delivered REQ is protocol-consumed."""
+        if not self.protocol_config.request_generates_response:
+            return True
+        if request_packet.transaction_id is None:
+            return True
+
+        response_src = request_packet.dst_chiplet
+        response_dst = request_packet.src_chiplet
+        if not self._can_accept_protocol_source_packet(response_src, MESSAGE_CLASS_RESP):
+            return False
+
+        response_packet = self._build_packet(
+            src_chiplet=response_src,
+            dst_chiplet=response_dst,
+            cycle=cycle,
+            rng=rng,
+            message_class=MESSAGE_CLASS_RESP,
+            transaction_id=request_packet.transaction_id,
+            request_packet_id=request_packet.packet_id,
+            src_boundary_router=request_packet.dst_boundary_router,
+            dst_boundary_router=request_packet.src_boundary_router,
+        )
+        if response_packet is None:
+            return False
+
+        self._record_packet_attempt(response_packet)
+        if not self._enqueue_protocol_source_packet(response_packet):
+            return False
+
+        record = self._transaction_records.get(request_packet.transaction_id)
+        if record is not None:
+            record.response_packet_id = response_packet.packet_id
+            record.response_created_cycle = cycle
+        return True
+
+    def _service_protocol_ejection_queues(
+        self,
+        cycle: int,
+        rng: random.Random,
+    ) -> None:
         """
-        Each chiplet independently decides whether to inject a packet this cycle.
+        Consume endpoint queues in fixed message-class priority order.
 
-        Injection model (direct-to-IR):
-          Flits bypass the boundary-router staging buffer and are written
-          directly into the attached IR's Down input-port VCs at injection time.
-          A normal VC in the Down port is eligible if it is unallocated AND has
-          at least ``FLITS_PER_PACKET`` free slots.  Source BRs are tried in
-          random order; the first eligible IR Down-port VC wins.
-          If no eligible VC exists across all source BRs, the injection fails
-          and ``_failed_injections`` is incremented.
+        RESP is treated as a sink class and is consumed greedily every cycle so
+        that it remains eventually drainable even when REQ queues are backlogged.
+        """
+        if not self._protocol_enabled():
+            return
 
-        Returns the count of successfully injected packets this cycle.
-        During PRE_DRAIN and FULL_DRAIN, injection is suppressed.
+        for chiplet in self.chiplets.values():
+            while chiplet.peek_ejection_packet(MESSAGE_CLASS_RESP) is not None:
+                response_packet = chiplet.pop_ejection_packet(MESSAGE_CLASS_RESP)
+                if response_packet is None:
+                    break
+                if response_packet.transaction_id is not None:
+                    record = self._transaction_records.get(response_packet.transaction_id)
+                    if record is not None and record.completed_cycle is None:
+                        record.completed_cycle = cycle
+                        self._transactions_completed += 1
+                        self._completed_transaction_latency_total += (
+                            cycle - record.request_created_cycle
+                        )
+
+            for message_class in self.protocol_config.service_order:
+                if message_class == MESSAGE_CLASS_RESP:
+                    continue
+                packet = chiplet.peek_ejection_packet(message_class)
+                if packet is None:
+                    continue
+                if message_class == MESSAGE_CLASS_REQ:
+                    if not self._try_generate_response_for_request(packet, cycle, rng):
+                        continue
+                chiplet.pop_ejection_packet(message_class)
+                break
+
+    def _try_inject_packet_into_network(
+        self,
+        packet: Packet,
+        rng: random.Random,
+    ) -> bool:
+        """Try to place all flits of one packet into an attached IR Down VC."""
+        for src_br in self._candidate_source_brs(packet, rng):
+            ir = self.routers[src_br.attached_ir]   # type: ignore[index]
+            down_port = ir.input_ports["Down"]
+            eligible = [
+                vc for vc in down_port.normal_vcs
+                if vc.allocated_flow_id is None
+                and (vc.capacity - vc.occupancy()) >= FLITS_PER_PACKET
+            ]
+            if not eligible:
+                continue
+
+            target_vc = rng.choice(eligible)
+            packet.src_boundary_router = src_br.router_id
+            packet.current_node = ir.router_id
+            for flit in packet.flits:
+                target_vc.push(flit)
+            src_br.record_injected_packet(packet)
+            self._record_packet_network_injection(packet)
+            return True
+        return False
+
+    def _injection_blocked_this_cycle(self, cycle: int) -> bool:
+        """
+        Preserve the current DRAIN behavior for new network injections.
+
+        PRE_DRAIN and FULL_DRAIN remain injection-free, and the cycle that
+        enters PRE_DRAIN also suppresses same-cycle network admission.
         """
         pre_drain_starts_this_cycle = (
             self.drain_enabled
@@ -1495,62 +2022,80 @@ class InterposerMesh:
             and cycle > 0
             and cycle % self.drain_period == 0
         )
-        if self._full_drain_active() or self._pre_drain_active() or pre_drain_starts_this_cycle:
+        return (
+            self._full_drain_active()
+            or self._pre_drain_active()
+            or pre_drain_starts_this_cycle
+        )
+
+    def inject_random_packets(
+        self,
+        cycle: int,
+        rng:   random.Random,
+        generate_new_traffic: bool = True,
+    ) -> int:
+        """
+        Inject traffic into the network for one cycle.
+
+        Legacy mode:
+          Flits bypass the boundary-router staging buffer and are written
+          directly into the attached IR's Down input-port VCs at injection time.
+          A normal VC in the Down port is eligible if it is unallocated AND has
+          at least ``FLITS_PER_PACKET`` free slots.  Source BRs are tried in
+          random order; the first eligible IR Down-port VC wins.
+
+        Protocol mode:
+          New REQ packets are generated into per-chiplet source queues, then one
+          queued packet per chiplet may enter the interposer each cycle.  During
+          cooldown, callers can set ``generate_new_traffic=False`` to stop new
+          REQ creation while still draining the source queues.
+
+        Returns the count of successfully injected packets this cycle.
+        During PRE_DRAIN and FULL_DRAIN, injection is suppressed.
+        """
+        if self._protocol_enabled():
+            if generate_new_traffic:
+                self._generate_protocol_request_traffic(cycle, rng)
+            if self._injection_blocked_this_cycle(cycle):
+                return 0
+
+            injected = 0
+            for chiplet in self.chiplets.values():
+                packet = chiplet.peek_next_injection_packet(self.protocol_config.service_order)
+                if packet is None:
+                    continue
+                if not self._try_inject_packet_into_network(packet, rng):
+                    continue
+                chiplet.pop_next_injection_packet(self.protocol_config.service_order)
+                injected += 1
+            return injected
+
+        if not generate_new_traffic:
             return 0
+        if self._injection_blocked_this_cycle(cycle):
+            return 0
+
         chiplet_names = list(self.chiplets.keys())
         injected = 0
         for src_name, chiplet in self.chiplets.items():
             rate = chiplet.current_injection_rate(cycle, rng)
             if rng.random() >= rate:
                 continue
-            self._attempted_injections += 1
-            self._attempted_injections_by_type[chiplet.chiplet_type] = (
-                self._attempted_injections_by_type.get(chiplet.chiplet_type, 0) + 1
-            )
             dst_name    = rng.choice([n for n in chiplet_names if n != src_name])
-            dst_chiplet = self.chiplets[dst_name]
-            if not dst_chiplet.boundary_routers:
+            pkt = self._build_packet(
+                src_chiplet=src_name,
+                dst_chiplet=dst_name,
+                cycle=cycle,
+                rng=rng,
+                message_class=MESSAGE_CLASS_REQ,
+            )
+            if pkt is None:
                 continue
-            dst_br = rng.choice(dst_chiplet.boundary_routers)
-
-            # Try source BRs in random order; push all flits into the first
-            # eligible Down-port normal VC found at the attached IR.
-            src_brs = list(chiplet.boundary_routers)
-            rng.shuffle(src_brs)
-            success = False
-            for src_br in src_brs:
-                ir        = self.routers[src_br.attached_ir]   # type: ignore[index]
-                down_port = ir.input_ports["Down"]
-                eligible  = [
-                    vc for vc in down_port.normal_vcs
-                    if vc.allocated_flow_id is None
-                    and (vc.capacity - vc.occupancy()) >= FLITS_PER_PACKET
-                ]
-                if not eligible:
-                    continue
-                target_vc = rng.choice(eligible)
-                pkt = Packet(
-                    packet_id=self._next_packet_id(),
-                    src_chiplet=src_name,
-                    dst_chiplet=dst_name,
-                    src_boundary_router=src_br.router_id,
-                    dst_boundary_router=dst_br.router_id,
-                    created_cycle=cycle,
-                    current_node=ir.router_id,
-                )
-                for flit in pkt.flits:
-                    target_vc.push(flit)
-                src_br.injected_packets.append(pkt)
+            self._record_packet_attempt(pkt)
+            if self._try_inject_packet_into_network(pkt, rng):
                 injected += 1
-                self._successful_injections += 1
-                self._successful_injections_by_type[chiplet.chiplet_type] = (
-                    self._successful_injections_by_type.get(chiplet.chiplet_type, 0) + 1
-                )
-                success = True
-                break
-
-            if not success:
-                self._failed_injections += 1
+                continue
+            self._record_packet_drop(pkt)
         return injected
 
     # ── DRAIN scheduling ──────────────────────────────────────────────────────
@@ -1612,15 +2157,16 @@ class InterposerMesh:
                     dst_br_id = flit.parent_packet.dst_boundary_router
                     dst_ir_id = self.boundary_routers[dst_br_id].attached_ir  # type: ignore[index]
                     if rid == dst_ir_id:
-                        port.escape_vc.pop()
                         pkt = flit.parent_packet
+                        if not self._reserve_packet_ejection(pkt):
+                            continue
+                        port.escape_vc.pop()
                         pkt.flits_delivered += 1
                         if pkt.flits_delivered == FLITS_PER_PACKET:
-                            dst_br = self.boundary_routers[dst_br_id]
-                            dst_br.receive_packet(pkt, cycle)
-                            self.chiplets[dst_br.chiplet_name].receive_packet(pkt)
+                            self._finalize_packet_delivery(pkt, cycle)
                         moves += 1
                         ejected += 1
+            self._service_protocol_ejection_queues(cycle, self._routing_rng)
             self._print_drain_debug(
                 cycle,
                 f"full_drain_step: hop_moves={hop_moves} ejected={ejected} hops_remaining={self._full_drain_hops_remaining}",
@@ -1639,6 +2185,7 @@ class InterposerMesh:
                     "strict_regular_drain: normal forwarding skipped",
                     force=True,
                 )
+                self._service_protocol_ejection_queues(cycle, self._routing_rng)
                 return moves
 
         # ── Phase 2b: per-port flit forwarding with output-port arbitration ─
@@ -1759,21 +2306,31 @@ class InterposerMesh:
 
         # ── Arbitrate and commit ──────────────────────────────────────────
         for (rid, out_dir), candidates in output_groups.items():
-            # Pick one winner at random among all eligible candidates.
-            winner = self._routing_rng.choice(candidates)
-            port_name, vc, _is_esc, flit, nxt_rid, use_escape_next = winner
             router = self.routers[rid]
 
             if out_dir == "Down":
+                eligible = [
+                    candidate
+                    for candidate in candidates
+                    if self._can_start_packet_ejection(candidate[3].parent_packet)
+                ]
+                if not eligible:
+                    continue
+                winner = self._routing_rng.choice(eligible)
+            else:
+                winner = self._routing_rng.choice(candidates)
+
+            port_name, vc, _is_esc, flit, nxt_rid, use_escape_next = winner
+
+            if out_dir == "Down":
                 # Eject: deliver flit to the boundary router.
-                vc.pop()
                 pkt = flit.parent_packet
+                if not self._reserve_packet_ejection(pkt):
+                    continue
+                vc.pop()
                 pkt.flits_delivered += 1
                 if pkt.flits_delivered == FLITS_PER_PACKET:
-                    dst_br_id = pkt.dst_boundary_router
-                    dst_br    = self.boundary_routers[dst_br_id]
-                    dst_br.receive_packet(pkt, cycle)
-                    self.chiplets[dst_br.chiplet_name].receive_packet(pkt)
+                    self._finalize_packet_delivery(pkt, cycle)
                 # Clear routing table if this is the worm tail.
                 if flit.is_worm_tail:
                     router.flow_output_table.pop(flit.flow_id, None)
@@ -1800,6 +2357,7 @@ class InterposerMesh:
 
                 moves += 1
 
+        self._service_protocol_ejection_queues(cycle, self._routing_rng)
         return moves
 
     # ── topology queries ──────────────────────────────────────────────────────
@@ -1850,7 +2408,7 @@ class InterposerMesh:
             "avg_hops":    round(avg_hops, 2),
         }
 
-    def delivered_stats(self) -> Dict[str, float]:
+    def delivered_stats(self) -> Dict[str, Any]:
         """Aggregate injection, delivery, latency, and backlog statistics."""
         delivered_packets = [
             pkt
@@ -1871,6 +2429,9 @@ class InterposerMesh:
             "in_flight_flits": self.all_in_flight(),
             "in_flight_packets_equiv": round(self.all_in_flight_packets_equiv(), 4),
         })
+        stats["per_message_class"] = self.delivered_stats_by_message_class()
+        if self._protocol_enabled():
+            stats["transactions"] = self.transaction_stats()
         return stats
 
     def delivered_stats_by_type(self) -> Dict[str, Dict[str, float]]:
@@ -1893,17 +2454,62 @@ class InterposerMesh:
         for chiplet_type in sorted(all_types):
             attempted = self._attempted_injections_by_type.get(chiplet_type, 0)
             injected = self._successful_injections_by_type.get(chiplet_type, 0)
+            failed = self._failed_injections_by_type.get(chiplet_type, 0)
             acceptance_rate = injected / attempted if attempted else 0.0
             type_stats = self._packet_stats(packets_by_type.get(chiplet_type, []))
             type_stats.update({
                 "attempted_injections": attempted,
                 "injected": injected,
-                "failed_injections": attempted - injected,
+                "failed_injections": failed,
                 "acceptance_rate": round(acceptance_rate, 4),
                 "chiplet_count": chiplet_counts_by_type.get(chiplet_type, 0),
             })
             stats_by_type[chiplet_type] = type_stats
         return stats_by_type
+
+    def delivered_stats_by_message_class(self) -> Dict[str, Dict[str, float]]:
+        """Aggregate delivered and injection statistics for each message class."""
+        packets_by_message_class: Dict[str, List[Packet]] = {
+            message_class: [] for message_class in MESSAGE_CLASSES
+        }
+        for chiplet in self.chiplets.values():
+            for packet in chiplet.received_packets:
+                packets_by_message_class[packet.message_class].append(packet)
+
+        stats_by_message_class: Dict[str, Dict[str, float]] = {}
+        for message_class in MESSAGE_CLASSES:
+            attempted = self._attempted_injections_by_message_class.get(message_class, 0)
+            injected = self._successful_injections_by_message_class.get(message_class, 0)
+            failed = self._failed_injections_by_message_class.get(message_class, 0)
+            acceptance_rate = injected / attempted if attempted else 0.0
+            class_stats = self._packet_stats(packets_by_message_class[message_class])
+            class_stats.update({
+                "attempted_injections": attempted,
+                "injected": injected,
+                "failed_injections": failed,
+                "acceptance_rate": round(acceptance_rate, 4),
+            })
+            stats_by_message_class[message_class] = class_stats
+        return stats_by_message_class
+
+    def transaction_stats(self) -> Dict[str, float]:
+        """Return REQ→RESP transaction completion statistics."""
+        completion_rate = (
+            self._transactions_completed / self._transactions_started
+            if self._transactions_started
+            else 0.0
+        )
+        avg_completion_latency = (
+            self._completed_transaction_latency_total / self._transactions_completed
+            if self._transactions_completed
+            else 0.0
+        )
+        return {
+            "started": self._transactions_started,
+            "completed": self._transactions_completed,
+            "completion_rate": round(completion_rate, 4),
+            "avg_completion_latency": round(avg_completion_latency, 2),
+        }
 
     def __repr__(self) -> str:
         cpu_count = sum(1 for s in self.chiplet_specs if s.chiplet_type == CHIPLET_CPU)
@@ -2259,8 +2865,6 @@ class DeadlockDetector:
 # Quick smoke-test
 # ═══════════════════════════════════════════════════════════════════════════════
 
-COOLDOWN_CYCLES = 10000   # injection-free cycles appended after each run
-
 
 def run_simulation(
     cycles:             int                        = 200,
@@ -2275,6 +2879,7 @@ def run_simulation(
     drain_window_hops:  int                        = DRAIN_WINDOW_HOPS,
     full_drain_every_n_windows: int               = FULL_DRAIN_EVERY_N_WINDOWS,
     pre_drain_cycles:   int                        = PRE_DRAIN_CYCLES,
+    protocol_config:    Optional[ProtocolConfig]   = None,
     verbose:            bool                       = False,
 ) -> Dict[str, Tuple[Dict[str, Any], DeadlockDetector]]:
     """
@@ -2305,6 +2910,7 @@ def run_simulation(
     full_drain_every_n_windows : Run a FULL_DRAIN once every N regular drain windows.
     pre_drain_cycles   : Cycles spent freezing new escape admissions before a
                          drain window begins.
+    protocol_config    : Optional protocol/message-class configuration.
     verbose            : Print a line each time a deadlock is detected.
 
     Returns
@@ -2313,6 +2919,8 @@ def run_simulation(
     """
     if chiplet_specs is None:
         chiplet_specs = build_image_layout()
+    if protocol_config is None:
+        protocol_config = build_default_protocol_config()
     effective_cpu_rate = CPU_INJECTION_RATE if cpu_injection_rate is None else cpu_injection_rate
     results: Dict[str, Tuple[Dict[str, Any], DeadlockDetector]] = {}
     if seed is None:
@@ -2352,6 +2960,7 @@ def run_simulation(
             cpu_injection_rate=effective_cpu_rate,
             gpu_burst_rate=4 * effective_cpu_rate,
             gpu_quiet_rate=effective_cpu_rate / 10.0,
+            protocol_config=protocol_config,
         )
 
         # Safety check: ensure CPU chiplets are using the intended swept rate.
@@ -2368,12 +2977,18 @@ def run_simulation(
 
         # ── Cooldown phase: no new packets injected ───────────────────────
         for cycle in range(cycles, cycles + cooldown_cycles):
+            mesh.inject_random_packets(cycle, rng, generate_new_traffic=False)
             mesh.step(cycle)
             detector.check(mesh, cycle)
 
         stats = mesh.delivered_stats()
         chiplet_count = max(1, len(mesh.chiplets))
         stats["throughput"] = round(stats["delivered"] / (cycles * chiplet_count), 6)
+        for message_class, class_stats in stats["per_message_class"].items():
+            class_stats["throughput"] = round(
+                class_stats["delivered"] / (cycles * chiplet_count),
+                6,
+            )
 
         per_type = mesh.delivered_stats_by_type()
         for chiplet_type, type_stats in per_type.items():
@@ -2413,6 +3028,38 @@ SCENARIO_DISPLAY = {
 }
 
 
+def _empty_message_class_metric_map() -> Dict[str, Dict[str, float]]:
+    """Return a fresh accumulator for per-message-class sweep metrics."""
+    return {
+        message_class: {
+            "attempted_injections": 0.0,
+            "injected": 0.0,
+            "failed_injections": 0.0,
+            "delivered": 0.0,
+            "throughput": 0.0,
+            "avg_latency": 0.0,
+        }
+        for message_class in MESSAGE_CLASSES
+    }
+
+
+def _empty_chiplet_type_metric_map() -> Dict[str, Dict[str, float]]:
+    """Return a fresh accumulator for per-chiplet-type sweep metrics."""
+    return {
+        chiplet_type: {
+            "attempted_injections": 0.0,
+            "injected": 0.0,
+            "failed_injections": 0.0,
+            "delivered": 0.0,
+            "throughput": 0.0,
+            "avg_latency": 0.0,
+            "acceptance_rate": 0.0,
+            "chiplet_count": 0.0,
+        }
+        for chiplet_type in (CHIPLET_CPU, CHIPLET_GPU)
+    }
+
+
 def sweep_injection_rates(
     chiplet_specs:      Optional[List[ChipletSpec]] = None,
     cycles:             int   = 5000,
@@ -2428,10 +3075,11 @@ def sweep_injection_rates(
     drain_window_hops:  int   = DRAIN_WINDOW_HOPS,
     full_drain_every_n_windows: int = FULL_DRAIN_EVERY_N_WINDOWS,
     pre_drain_cycles:   int   = PRE_DRAIN_CYCLES,
+    protocol_config:    Optional[ProtocolConfig] = None,
     num_seeds:          int   = 5,
     drain_period_c:     Optional[float] = 0.2,
     drain_period_alpha: float           = 2.0,
-) -> Dict[str, Dict[float, Dict[str, int]]]:
+) -> Dict[str, Dict[float, Dict[str, Any]]]:
     """
     Sweep CPU INJECTION_RATE and collect packet counts per scenario.
 
@@ -2455,6 +3103,8 @@ def sweep_injection_rates(
     """
     if chiplet_specs is None:
         chiplet_specs = build_image_layout()
+    if protocol_config is None:
+        protocol_config = build_default_protocol_config()
 
     rates = [
         round(rate_min + i * rate_step, 10)
@@ -2462,7 +3112,7 @@ def sweep_injection_rates(
         if rate_min + i * rate_step <= rate_max + 1e-9
     ]
 
-    sweep: Dict[str, Dict[float, Dict[str, int]]] = {label: {} for label in SCENARIO_LABELS}
+    sweep: Dict[str, Dict[float, Dict[str, Any]]] = {label: {} for label in SCENARIO_LABELS}
     total = len(rates)
     for idx, rate in enumerate(rates):
         effective_drain_period = (
@@ -2474,8 +3124,21 @@ def sweep_injection_rates(
         print(f"  rate={rate:.6f}, drain_period={effective_drain_period} ({idx + 1}/{total})", flush=True)
 
         # Accumulate totals across multiple seeds, then average.
-        accum: Dict[str, Dict[str, float]] = {
-            label: {"injected": 0.0, "delivered": 0.0, "failed_injections": 0.0, "avg_latency": 0.0}
+        accum: Dict[str, Dict[str, Any]] = {
+            label: {
+                "injected": 0.0,
+                "delivered": 0.0,
+                "failed_injections": 0.0,
+                "avg_latency": 0.0,
+                "per_message_class": _empty_message_class_metric_map(),
+                "per_type": _empty_chiplet_type_metric_map(),
+                "transactions": {
+                    "started": 0.0,
+                    "completed": 0.0,
+                    "completion_rate": 0.0,
+                    "avg_completion_latency": 0.0,
+                },
+            }
             for label in SCENARIO_LABELS
         }
         for seed_offset in range(num_seeds):
@@ -2492,6 +3155,7 @@ def sweep_injection_rates(
                 drain_window_hops=drain_window_hops,
                 full_drain_every_n_windows=full_drain_every_n_windows,
                 pre_drain_cycles=pre_drain_cycles,
+                protocol_config=protocol_config,
             )
             for label in SCENARIO_LABELS:
                 stats = results[label][0]
@@ -2500,13 +3164,108 @@ def sweep_injection_rates(
                 accum[label]["failed_injections"] += stats["failed_injections"]
                 accum[label]["avg_latency"]       += float(stats["avg_latency"])
 
+                per_type = stats.get("per_type", {})
+                for chiplet_type in (CHIPLET_CPU, CHIPLET_GPU):
+                    type_stats = per_type.get(chiplet_type, {})
+                    accum[label]["per_type"][chiplet_type]["attempted_injections"] += float(
+                        type_stats.get("attempted_injections", 0)
+                    )
+                    accum[label]["per_type"][chiplet_type]["injected"] += float(
+                        type_stats.get("injected", 0)
+                    )
+                    accum[label]["per_type"][chiplet_type]["failed_injections"] += float(
+                        type_stats.get("failed_injections", 0)
+                    )
+                    accum[label]["per_type"][chiplet_type]["delivered"] += float(
+                        type_stats.get("delivered", 0)
+                    )
+                    accum[label]["per_type"][chiplet_type]["throughput"] += float(
+                        type_stats.get("throughput", 0.0)
+                    )
+                    accum[label]["per_type"][chiplet_type]["avg_latency"] += float(
+                        type_stats.get("avg_latency", 0.0)
+                    )
+                    accum[label]["per_type"][chiplet_type]["acceptance_rate"] += float(
+                        type_stats.get("acceptance_rate", 0.0)
+                    )
+                    accum[label]["per_type"][chiplet_type]["chiplet_count"] += float(
+                        type_stats.get("chiplet_count", 0)
+                    )
+
+                per_message_class = stats.get("per_message_class", {})
+                for message_class in MESSAGE_CLASSES:
+                    class_stats = per_message_class.get(message_class, {})
+                    accum[label]["per_message_class"][message_class]["attempted_injections"] += float(
+                        class_stats.get("attempted_injections", 0)
+                    )
+                    accum[label]["per_message_class"][message_class]["injected"] += float(
+                        class_stats.get("injected", 0)
+                    )
+                    accum[label]["per_message_class"][message_class]["failed_injections"] += float(
+                        class_stats.get("failed_injections", 0)
+                    )
+                    accum[label]["per_message_class"][message_class]["delivered"] += float(
+                        class_stats.get("delivered", 0)
+                    )
+                    accum[label]["per_message_class"][message_class]["throughput"] += float(
+                        class_stats.get("throughput", 0.0)
+                    )
+                    accum[label]["per_message_class"][message_class]["avg_latency"] += float(
+                        class_stats.get("avg_latency", 0.0)
+                    )
+
+                transactions = stats.get("transactions")
+                if isinstance(transactions, dict):
+                    accum[label]["transactions"]["started"] += float(transactions.get("started", 0))
+                    accum[label]["transactions"]["completed"] += float(transactions.get("completed", 0))
+                    accum[label]["transactions"]["completion_rate"] += float(
+                        transactions.get("completion_rate", 0.0)
+                    )
+                    accum[label]["transactions"]["avg_completion_latency"] += float(
+                        transactions.get("avg_completion_latency", 0.0)
+                    )
+
         for label in SCENARIO_LABELS:
-            sweep[label][rate] = {
+            averaged_stats: Dict[str, Any] = {
                 "injected":          int(round(accum[label]["injected"]          / num_seeds)),
                 "delivered":         int(round(accum[label]["delivered"]         / num_seeds)),
                 "failed_injections": int(round(accum[label]["failed_injections"] / num_seeds)),
                 "avg_latency":       accum[label]["avg_latency"] / num_seeds,
             }
+            averaged_stats["per_type"] = {}
+            for chiplet_type in (CHIPLET_CPU, CHIPLET_GPU):
+                type_accum = accum[label]["per_type"][chiplet_type]
+                averaged_stats["per_type"][chiplet_type] = {
+                    "attempted_injections": int(round(type_accum["attempted_injections"] / num_seeds)),
+                    "injected": int(round(type_accum["injected"] / num_seeds)),
+                    "failed_injections": int(round(type_accum["failed_injections"] / num_seeds)),
+                    "delivered": int(round(type_accum["delivered"] / num_seeds)),
+                    "throughput": type_accum["throughput"] / num_seeds,
+                    "avg_latency": type_accum["avg_latency"] / num_seeds,
+                    "acceptance_rate": type_accum["acceptance_rate"] / num_seeds,
+                    "chiplet_count": int(round(type_accum["chiplet_count"] / num_seeds)),
+                }
+            averaged_stats["per_message_class"] = {}
+            for message_class in MESSAGE_CLASSES:
+                class_accum = accum[label]["per_message_class"][message_class]
+                averaged_stats["per_message_class"][message_class] = {
+                    "attempted_injections": int(round(class_accum["attempted_injections"] / num_seeds)),
+                    "injected": int(round(class_accum["injected"] / num_seeds)),
+                    "failed_injections": int(round(class_accum["failed_injections"] / num_seeds)),
+                    "delivered": int(round(class_accum["delivered"] / num_seeds)),
+                    "throughput": class_accum["throughput"] / num_seeds,
+                    "avg_latency": class_accum["avg_latency"] / num_seeds,
+                }
+
+            transactions = accum[label]["transactions"]
+            if any(transactions.values()):
+                averaged_stats["transactions"] = {
+                    "started": int(round(transactions["started"] / num_seeds)),
+                    "completed": int(round(transactions["completed"] / num_seeds)),
+                    "completion_rate": transactions["completion_rate"] / num_seeds,
+                    "avg_completion_latency": transactions["avg_completion_latency"] / num_seeds,
+                }
+            sweep[label][rate] = averaged_stats
     return sweep
 
 
@@ -2522,6 +3281,7 @@ def sweep_drain_window(
     full_drain_every_n_windows: int = FULL_DRAIN_EVERY_N_WINDOWS,
     pre_drain_cycles:   int   = PRE_DRAIN_CYCLES,
     drain_escape_entry_prob: float = DRAIN_ESCAPE_ENTRY_PROB,
+    protocol_config:    Optional[ProtocolConfig] = None,
     seed:               int   = 42,
     routing_seed:       int   = 0,
     num_seeds:          int   = 3,
@@ -2535,6 +3295,8 @@ def sweep_drain_window(
     """
     if chiplet_specs is None:
         chiplet_specs = build_image_layout()
+    if protocol_config is None:
+        protocol_config = build_default_protocol_config()
 
     periods = list(range(drain_period_min, drain_period_max + 1, drain_period_step))
     result: Dict[int, Dict[str, int]] = {}
@@ -2560,6 +3322,7 @@ def sweep_drain_window(
                 cpu_injection_rate=cpu_injection_rate,
                 gpu_burst_rate=4 * cpu_injection_rate,
                 gpu_quiet_rate=cpu_injection_rate / 10.0,
+                protocol_config=protocol_config,
             )
             detector = DeadlockDetector()
 
@@ -2569,6 +3332,7 @@ def sweep_drain_window(
                 detector.check(mesh, cycle)
 
             for cycle in range(cycles, cycles + cooldown_cycles):
+                mesh.inject_random_packets(cycle, rng, generate_new_traffic=False)
                 mesh.step(cycle)
                 detector.check(mesh, cycle)
 
@@ -2650,6 +3414,7 @@ def sweep_full_drain_window(
     drain_window_hops:  int   = DRAIN_WINDOW_HOPS,
     pre_drain_cycles:   int   = PRE_DRAIN_CYCLES,
     drain_escape_entry_prob: float = DRAIN_ESCAPE_ENTRY_PROB,
+    protocol_config:    Optional[ProtocolConfig] = None,
     seed:               int   = 42,
     routing_seed:       int   = 0,
     num_seeds:          int   = 3,
@@ -2664,6 +3429,8 @@ def sweep_full_drain_window(
     """
     if chiplet_specs is None:
         chiplet_specs = build_image_layout()
+    if protocol_config is None:
+        protocol_config = build_default_protocol_config()
     if full_drain_every_values is None:
         full_drain_every_values = [5, 10, 20, 50]
 
@@ -2691,6 +3458,7 @@ def sweep_full_drain_window(
                 cpu_injection_rate=cpu_injection_rate,
                 gpu_burst_rate=4 * cpu_injection_rate,
                 gpu_quiet_rate=cpu_injection_rate / 10.0,
+                protocol_config=protocol_config,
             )
             detector = DeadlockDetector()
 
@@ -2700,6 +3468,7 @@ def sweep_full_drain_window(
                 detector.check(mesh, cycle)
 
             for cycle in range(cycles, cycles + cooldown_cycles):
+                mesh.inject_random_packets(cycle, rng, generate_new_traffic=False)
                 mesh.step(cycle)
                 detector.check(mesh, cycle)
 
@@ -2782,6 +3551,7 @@ def sweep_escape_prob(
     drain_period:        int   = DRAIN_PERIOD,
     drain_window_hops:   int   = DRAIN_WINDOW_HOPS,
     pre_drain_cycles:    int   = PRE_DRAIN_CYCLES,
+    protocol_config:     Optional[ProtocolConfig] = None,
     seed:                int   = 42,
     routing_seed:        int   = 0,
     num_seeds:           int   = 3,
@@ -2795,6 +3565,8 @@ def sweep_escape_prob(
     """
     if chiplet_specs is None:
         chiplet_specs = build_image_layout()
+    if protocol_config is None:
+        protocol_config = build_default_protocol_config()
 
     probs = [
         round(prob_min + i * prob_step, 10)
@@ -2823,6 +3595,7 @@ def sweep_escape_prob(
                 cpu_injection_rate=cpu_injection_rate,
                 gpu_burst_rate=4 * cpu_injection_rate,
                 gpu_quiet_rate=cpu_injection_rate / 10.0,
+                protocol_config=protocol_config,
             )
             detector = DeadlockDetector()
 
@@ -2832,6 +3605,7 @@ def sweep_escape_prob(
                 detector.check(mesh, cycle)
 
             for cycle in range(cycles, cycles + cooldown_cycles):
+                mesh.inject_random_packets(cycle, rng, generate_new_traffic=False)
                 mesh.step(cycle)
                 detector.check(mesh, cycle)
 
@@ -3123,7 +3897,7 @@ def plot_injection_sweep(
 
 
 def plot_latency_sweep_all_scenarios(
-    sweep:      Dict[str, Dict[float, Dict[str, int]]],
+    sweep:      Dict[str, Dict[float, Dict[str, Any]]],
     out_prefix: str  = "injection_rate_sweep",
     show:       bool = True,
 ) -> None:
@@ -3167,6 +3941,230 @@ def plot_latency_sweep_all_scenarios(
     plt.close(fig)
 
 
+def write_injection_sweep_summary_text(
+    sweep: Dict[str, Dict[float, Dict[str, Any]]],
+    out_file: str = "injection_rate_sweep_summary.txt",
+    protocol_config: Optional[ProtocolConfig] = None,
+) -> None:
+    """Write a human-readable injection-rate sweep summary to a text file."""
+    if protocol_config is not None:
+        traffic_mode = (
+            "NEW_PROTOCOL_REQ_RESP"
+            if protocol_config.enabled
+            else "LEGACY_SINGLE_CLASS"
+        )
+    else:
+        traffic_mode = "LEGACY_SINGLE_CLASS"
+        for label_data in sweep.values():
+            for stats in label_data.values():
+                if "transactions" in stats:
+                    traffic_mode = "NEW_PROTOCOL_REQ_RESP"
+                    break
+            if traffic_mode == "NEW_PROTOCOL_REQ_RESP":
+                break
+
+    lines: List[str] = []
+    lines.append("Injection Rate Sweep Summary")
+    lines.append("=" * 72)
+    lines.append(f"Traffic Mode: {traffic_mode}")
+    if traffic_mode == "LEGACY_SINGLE_CLASS":
+        lines.append("  Legacy mode: existing single-class packet injection workload.")
+    else:
+        lines.append("  New protocol mode: REQ source traffic with generated RESP replies.")
+    lines.append("")
+    for label in SCENARIO_LABELS:
+        if label not in sweep:
+            continue
+        lines.append(f"Scenario: {SCENARIO_DISPLAY.get(label, label)}")
+        lines.append("-" * 72)
+        for rate in sorted(sweep[label].keys()):
+            stats = sweep[label][rate]
+            lines.append(
+                "  rate={rate:.6f}  injected={injected}  delivered={delivered}  "
+                "failed={failed}  avg_latency={avg_latency:.2f}".format(
+                    rate=rate,
+                    injected=int(stats.get("injected", 0)),
+                    delivered=int(stats.get("delivered", 0)),
+                    failed=int(stats.get("failed_injections", 0)),
+                    avg_latency=float(stats.get("avg_latency", 0.0)),
+                )
+            )
+            per_type = stats.get("per_type", {})
+            for chiplet_type in (CHIPLET_CPU, CHIPLET_GPU):
+                type_stats = per_type.get(chiplet_type, {})
+                lines.append(
+                    "    {chiplet_type:<4} attempted={attempted:>6}  injected={injected:>6}  "
+                    "failed={failed:>6}  delivered={delivered:>6}  throughput={throughput:>8.6f}  "
+                    "avg_latency={avg_latency:>8.2f}  acceptance={acceptance:>6.4f}  count={count}".format(
+                        chiplet_type=chiplet_type,
+                        attempted=int(type_stats.get("attempted_injections", 0)),
+                        injected=int(type_stats.get("injected", 0)),
+                        failed=int(type_stats.get("failed_injections", 0)),
+                        delivered=int(type_stats.get("delivered", 0)),
+                        throughput=float(type_stats.get("throughput", 0.0)),
+                        avg_latency=float(type_stats.get("avg_latency", 0.0)),
+                        acceptance=float(type_stats.get("acceptance_rate", 0.0)),
+                        count=int(type_stats.get("chiplet_count", 0)),
+                    )
+                )
+            per_message_class = stats.get("per_message_class", {})
+            for message_class in MESSAGE_CLASSES:
+                class_stats = per_message_class.get(message_class, {})
+                lines.append(
+                    "    {message_class:<4} attempted={attempted:>6}  injected={injected:>6}  "
+                    "failed={failed:>6}  delivered={delivered:>6}  throughput={throughput:>8.6f}  "
+                    "avg_latency={avg_latency:>8.2f}".format(
+                        message_class=message_class,
+                        attempted=int(class_stats.get("attempted_injections", 0)),
+                        injected=int(class_stats.get("injected", 0)),
+                        failed=int(class_stats.get("failed_injections", 0)),
+                        delivered=int(class_stats.get("delivered", 0)),
+                        throughput=float(class_stats.get("throughput", 0.0)),
+                        avg_latency=float(class_stats.get("avg_latency", 0.0)),
+                    )
+                )
+            transactions = stats.get("transactions")
+            if isinstance(transactions, dict):
+                lines.append(
+                    "    transactions started={started}  completed={completed}  "
+                    "completion_rate={completion_rate:.4f}  avg_completion_latency={avg_completion_latency:.2f}".format(
+                        started=int(transactions.get("started", 0)),
+                        completed=int(transactions.get("completed", 0)),
+                        completion_rate=float(transactions.get("completion_rate", 0.0)),
+                        avg_completion_latency=float(
+                            transactions.get("avg_completion_latency", 0.0)
+                        ),
+                    )
+                )
+        lines.append("")
+
+    with open(out_file, "w", encoding="ascii") as handle:
+        handle.write("\n".join(lines).rstrip() + "\n")
+    print(f"  Saved: {out_file}")
+
+
+def plot_message_class_sweep(
+    sweep: Dict[str, Dict[float, Dict[str, Any]]],
+    scenario_label: str = "random_adaptive_with_drain",
+    out_prefix: str = "injection_rate_sweep",
+    show: bool = True,
+) -> None:
+    """
+    Plot per-message-class packet counts and latency for one scenario.
+
+    The packet-count figure shows injected and delivered packets for each class.
+    The latency figure shows the average delivered-packet latency by class.
+    """
+    if scenario_label not in sweep or not sweep[scenario_label]:
+        return
+
+    import os
+    import tempfile
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams.update({"font.size": 12})
+
+    rates = sorted(sweep[scenario_label].keys())
+    colors = {
+        MESSAGE_CLASS_REQ: "steelblue",
+        MESSAGE_CLASS_RESP: "darkorange",
+        MESSAGE_CLASS_DATA: "seagreen",
+        MESSAGE_CLASS_CTRL: "firebrick",
+    }
+    markers = {
+        MESSAGE_CLASS_REQ: "o",
+        MESSAGE_CLASS_RESP: "s",
+        MESSAGE_CLASS_DATA: "^",
+        MESSAGE_CLASS_CTRL: "D",
+    }
+
+    fig_packets, ax_packets = plt.subplots(figsize=(9, 6))
+    fig_latency, ax_latency = plt.subplots(figsize=(9, 6))
+
+    for message_class in MESSAGE_CLASSES:
+        injected = [
+            sweep[scenario_label][rate]
+            .get("per_message_class", {})
+            .get(message_class, {})
+            .get("injected", 0)
+            for rate in rates
+        ]
+        delivered = [
+            sweep[scenario_label][rate]
+            .get("per_message_class", {})
+            .get(message_class, {})
+            .get("delivered", 0)
+            for rate in rates
+        ]
+        latencies = [
+            float(
+                sweep[scenario_label][rate]
+                .get("per_message_class", {})
+                .get(message_class, {})
+                .get("avg_latency", 0.0)
+            )
+            for rate in rates
+        ]
+        if not any(injected) and not any(delivered):
+            continue
+
+        ax_packets.plot(
+            rates,
+            injected,
+            marker=markers[message_class],
+            linewidth=2,
+            color=colors[message_class],
+            label=f"{message_class} Injected",
+        )
+        ax_packets.plot(
+            rates,
+            delivered,
+            marker=markers[message_class],
+            linewidth=2,
+            linestyle="--",
+            color=colors[message_class],
+            alpha=0.85,
+            label=f"{message_class} Delivered",
+        )
+        ax_latency.plot(
+            rates,
+            latencies,
+            marker=markers[message_class],
+            linewidth=2,
+            color=colors[message_class],
+            label=message_class,
+        )
+
+    title = SCENARIO_DISPLAY.get(scenario_label, scenario_label)
+    ax_packets.set_xlabel("INJECTION_RATE")
+    ax_packets.set_ylabel("# Packets")
+    ax_packets.set_title(f"{title}\nPer-Message-Class Packets vs INJECTION_RATE")
+    ax_packets.grid(True, linestyle="--", alpha=0.5)
+    ax_packets.legend(fontsize=9)
+    fig_packets.tight_layout()
+
+    ax_latency.set_xlabel("INJECTION_RATE")
+    ax_latency.set_ylabel("Avg Packet Latency (cycles)")
+    ax_latency.set_title(f"{title}\nPer-Message-Class Avg Packet Latency vs INJECTION_RATE")
+    ax_latency.grid(True, linestyle="--", alpha=0.5)
+    ax_latency.legend(fontsize=9)
+    fig_latency.tight_layout()
+
+    packet_file = f"{out_prefix}_{scenario_label}_message_class_packets.png"
+    latency_file = f"{out_prefix}_{scenario_label}_message_class_latency.png"
+    fig_packets.savefig(packet_file, dpi=150)
+    fig_latency.savefig(latency_file, dpi=150)
+    print(f"  Saved: {packet_file}")
+    print(f"  Saved: {latency_file}")
+    if show:
+        plt.show()
+    plt.close(fig_packets)
+    plt.close(fig_latency)
+
+
 def sweep_fault_count(
     chiplet_specs:       Optional[List[ChipletSpec]] = None,
     fault_counts:        List[int]  = None,
@@ -3177,6 +4175,7 @@ def sweep_fault_count(
     drain_window_hops:   int   = DRAIN_WINDOW_HOPS,
     pre_drain_cycles:    int   = PRE_DRAIN_CYCLES,
     escape_entry_prob:   float = 0.1,
+    protocol_config:     Optional[ProtocolConfig] = None,
     seed:                int   = 42,
     routing_seed:        int   = 0,
     num_seeds:           int   = 3,
@@ -3218,6 +4217,8 @@ def sweep_fault_count(
     """
     if chiplet_specs is None:
         chiplet_specs = build_image_layout()
+    if protocol_config is None:
+        protocol_config = build_default_protocol_config()
     if fault_counts is None:
         fault_counts = [0, 1, 4, 8, 12]
 
@@ -3258,6 +4259,7 @@ def sweep_fault_count(
                     cpu_injection_rate=cpu_injection_rate,
                     gpu_burst_rate=4 * cpu_injection_rate,
                     gpu_quiet_rate=cpu_injection_rate / 10.0,
+                    protocol_config=protocol_config,
                 )
 
                 if num_faults > 0:
@@ -3271,6 +4273,7 @@ def sweep_fault_count(
                     detector.check(mesh, cycle)
 
                 for cycle in range(cycles, cycles + cooldown_cycles):
+                    mesh.inject_random_packets(cycle, traffic_rng, generate_new_traffic=False)
                     mesh.step(cycle)
                     detector.check(mesh, cycle)
 
@@ -3406,20 +4409,28 @@ if __name__ == "__main__":
     #             print(f"    {chiplet_name}: {injected_by_chiplet[chiplet_name]}")
     #     print(f"  {det.summary()}")
 
+    out_prefix = "outputs/injection_rate_sweep"
     print("Sweeping INJECTION_RATE from 0.05 to 0.50 (step 0.025, averaged over 5 seeds) ...")
     sweep = sweep_injection_rates(
         chiplet_specs=specs,
         cycles=20000,
-        rate_min=0.01,
-        rate_max=0.031,
-        rate_step=0.005,
-        seed=42,
+        rate_min=0.001,
+        rate_max=0.031, #0.031,
+        rate_step=0.01,
+        seed=23, # 42,
         routing_seed=0,
-        num_seeds=3,
+        num_seeds=1,
     )
     print("Generating sweep plots ...")
-    plot_injection_sweep(sweep, out_prefix="injection_rate_sweep", show=False)
-    plot_latency_sweep_all_scenarios(sweep, out_prefix="injection_rate_sweep", show=False)
+    plot_injection_sweep(sweep, out_prefix=out_prefix, show=False)
+    plot_latency_sweep_all_scenarios(sweep, out_prefix=out_prefix, show=False)
+    text_out_file = f"{out_prefix}_summary.txt"
+    write_injection_sweep_summary_text(
+        sweep,
+        out_file=text_out_file,
+    )
+    
+    plot_message_class_sweep(sweep, scenario_label = "random_adaptive_with_drain", out_prefix = out_prefix, show=True)
     print()
 
 

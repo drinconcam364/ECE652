@@ -1,0 +1,214 @@
+Injection Rate Sweep Summary
+========================================================================
+Traffic Mode: NEW_PROTOCOL_REQ_RESP
+  New protocol mode: REQ source traffic with generated RESP replies.
+
+Scenario: XY (deadlock-free)
+------------------------------------------------------------------------
+  rate=0.001000  injected=177  delivered=176  failed=0  avg_latency=5.99
+    CPU  attempted=    31  injected=    31  failed=     0  delivered=    31  throughput=0.001550  avg_latency=    5.35  acceptance=1.0000  count=1
+    GPU  attempted=   146  injected=   146  failed=     0  delivered=   145  throughput=0.001813  avg_latency=    6.12  acceptance=1.0000  count=4
+    REQ  attempted=    89  injected=    89  failed=     0  delivered=    88  throughput=0.000880  avg_latency=    5.50
+    RESP attempted=    88  injected=    88  failed=     0  delivered=    88  throughput=0.000880  avg_latency=    6.48
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=89  completed=88  completion_rate=0.9888  avg_completion_latency=11.98
+  rate=0.011000  injected=1273  delivered=1200  failed=325  avg_latency=6.46
+    CPU  attempted=   342  injected=   216  failed=   101  delivered=   209  throughput=0.010450  avg_latency=    5.53  acceptance=0.6316  count=1
+    GPU  attempted=  1292  injected=  1057  failed=   224  delivered=   991  throughput=0.012387  avg_latency=    6.66  acceptance=0.8181  count=4
+    REQ  attempted=  1033  injected=   682  failed=   325  delivered=   628  throughput=0.006280  avg_latency=    6.05
+    RESP attempted=   601  injected=   591  failed=     0  delivered=   572  throughput=0.005720  avg_latency=    6.92
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=708  completed=572  completion_rate=0.8079  avg_completion_latency=12.95
+  rate=0.021000  injected=878  delivered=797  failed=1404  avg_latency=6.41
+    CPU  attempted=   538  injected=   230  failed=   294  delivered=   218  throughput=0.010900  avg_latency=    5.61  acceptance=0.4275  count=1
+    GPU  attempted=  1789  injected=   648  failed=  1110  delivered=   579  throughput=0.007238  avg_latency=    6.71  acceptance=0.3622  count=4
+    REQ  attempted=  1937  injected=   514  failed=  1404  delivered=   453  throughput=0.004530  avg_latency=    6.11
+    RESP attempted=   390  injected=   364  failed=     0  delivered=   344  throughput=0.003440  avg_latency=    6.80
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=533  completed=344  completion_rate=0.6454  avg_completion_latency=12.92
+  rate=0.031000  injected=788  delivered=720  failed=2427  avg_latency=7.37
+    CPU  attempted=   712  injected=    88  failed=   595  delivered=    85  throughput=0.004250  avg_latency=    6.31  acceptance=0.1236  count=1
+    GPU  attempted=  2559  injected=   700  failed=  1832  delivered=   635  throughput=0.007938  avg_latency=    7.51  acceptance=0.2735  count=4
+    REQ  attempted=  2904  injected=   446  failed=  2427  delivered=   397  throughput=0.003970  avg_latency=    6.99
+    RESP attempted=   367  injected=   342  failed=     0  delivered=   323  throughput=0.003230  avg_latency=    7.84
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=477  completed=323  completion_rate=0.6771  avg_completion_latency=14.85
+
+Scenario: YX (deadlock-free)
+------------------------------------------------------------------------
+  rate=0.001000  injected=178  delivered=178  failed=0  avg_latency=6.03
+    CPU  attempted=    32  injected=    32  failed=     0  delivered=    32  throughput=0.001600  avg_latency=    5.34  acceptance=1.0000  count=1
+    GPU  attempted=   146  injected=   146  failed=     0  delivered=   146  throughput=0.001825  avg_latency=    6.18  acceptance=1.0000  count=4
+    REQ  attempted=    89  injected=    89  failed=     0  delivered=    89  throughput=0.000890  avg_latency=    5.51
+    RESP attempted=    89  injected=    89  failed=     0  delivered=    89  throughput=0.000890  avg_latency=    6.56
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=89  completed=89  completion_rate=1.0000  avg_completion_latency=12.07
+  rate=0.011000  injected=991  delivered=921  failed=464  avg_latency=6.63
+    CPU  attempted=   303  injected=   114  failed=   161  delivered=   110  throughput=0.005500  avg_latency=    5.69  acceptance=0.3762  count=1
+    GPU  attempted=  1206  injected=   877  failed=   303  delivered=   811  throughput=0.010138  avg_latency=    6.76  acceptance=0.7272  count=4
+    REQ  attempted=  1041  injected=   544  failed=   464  delivered=   497  throughput=0.004970  avg_latency=    6.20
+    RESP attempted=   468  injected=   447  failed=     0  delivered=   424  throughput=0.004240  avg_latency=    7.13
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=577  completed=424  completion_rate=0.7348  avg_completion_latency=13.38
+  rate=0.021000  injected=2262  delivered=2184  failed=649  avg_latency=7.07
+    CPU  attempted=   664  injected=   517  failed=   130  delivered=   509  throughput=0.025450  avg_latency=    5.98  acceptance=0.7786  count=1
+    GPU  attempted=  2297  injected=  1745  failed=   519  delivered=  1675  throughput=0.020938  avg_latency=    7.40  acceptance=0.7597  count=4
+    REQ  attempted=  1875  injected=  1196  failed=   649  delivered=  1146  throughput=0.011460  avg_latency=    6.70
+    RESP attempted=  1086  injected=  1066  failed=     0  delivered=  1038  throughput=0.010380  avg_latency=    7.47
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=1226  completed=1038  completion_rate=0.8467  avg_completion_latency=14.10
+  rate=0.031000  injected=950  delivered=869  failed=2187  avg_latency=7.23
+    CPU  attempted=   723  injected=   174  failed=   524  delivered=   167  throughput=0.008350  avg_latency=    6.07  acceptance=0.2407  count=1
+    GPU  attempted=  2471  injected=   776  failed=  1663  delivered=   702  throughput=0.008775  avg_latency=    7.50  acceptance=0.3140  count=4
+    REQ  attempted=  2758  injected=   540  failed=  2187  delivered=   491  throughput=0.004910  avg_latency=    6.98
+    RESP attempted=   436  injected=   410  failed=     0  delivered=   378  throughput=0.003780  avg_latency=    7.55
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=571  completed=378  completion_rate=0.6620  avg_completion_latency=14.58
+
+Scenario: Random Adaptive (no DRAIN)
+------------------------------------------------------------------------
+  rate=0.001000  injected=178  delivered=178  failed=0  avg_latency=6.01
+    CPU  attempted=    32  injected=    32  failed=     0  delivered=    32  throughput=0.001600  avg_latency=    5.34  acceptance=1.0000  count=1
+    GPU  attempted=   146  injected=   146  failed=     0  delivered=   146  throughput=0.001825  avg_latency=    6.15  acceptance=1.0000  count=4
+    REQ  attempted=    89  injected=    89  failed=     0  delivered=    89  throughput=0.000890  avg_latency=    5.51
+    RESP attempted=    89  injected=    89  failed=     0  delivered=    89  throughput=0.000890  avg_latency=    6.51
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=89  completed=89  completion_rate=1.0000  avg_completion_latency=12.01
+  rate=0.011000  injected=1028  delivered=945  failed=452  avg_latency=6.59
+    CPU  attempted=   325  injected=   211  failed=    95  delivered=   203  throughput=0.010150  avg_latency=    5.80  acceptance=0.6492  count=1
+    GPU  attempted=  1199  injected=   817  failed=   357  delivered=   742  throughput=0.009275  avg_latency=    6.81  acceptance=0.6814  count=4
+    REQ  attempted=  1035  injected=   560  failed=   452  delivered=   503  throughput=0.005030  avg_latency=    6.14
+    RESP attempted=   489  injected=   468  failed=     0  delivered=   442  throughput=0.004420  avg_latency=    7.10
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=583  completed=442  completion_rate=0.7581  avg_completion_latency=13.23
+  rate=0.021000  injected=977  delivered=895  failed=1349  avg_latency=7.14
+    CPU  attempted=   477  injected=   180  failed=   281  delivered=   178  throughput=0.008900  avg_latency=    6.24  acceptance=0.3774  count=1
+    GPU  attempted=  1874  injected=   797  failed=  1068  delivered=   717  throughput=0.008962  avg_latency=    7.36  acceptance=0.4253  count=4
+    REQ  attempted=  1890  injected=   517  failed=  1349  delivered=   461  throughput=0.004610  avg_latency=    6.76
+    RESP attempted=   461  injected=   460  failed=     0  delivered=   434  throughput=0.004340  avg_latency=    7.53
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=541  completed=434  completion_rate=0.8022  avg_completion_latency=14.28
+  rate=0.031000  injected=539  delivered=455  failed=2510  avg_latency=7.24
+    CPU  attempted=   679  injected=   105  failed=   559  delivered=   100  throughput=0.005000  avg_latency=    6.01  acceptance=0.1546  count=1
+    GPU  attempted=  2387  injected=   434  failed=  1951  delivered=   355  throughput=0.004437  avg_latency=    7.58  acceptance=0.1818  count=4
+    REQ  attempted=  2828  injected=   307  failed=  2510  delivered=   238  throughput=0.002380  avg_latency=    6.86
+    RESP attempted=   238  injected=   232  failed=     0  delivered=   217  throughput=0.002170  avg_latency=    7.65
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=318  completed=217  completion_rate=0.6824  avg_completion_latency=14.44
+
+Scenario: Random Adaptive + DRAIN
+------------------------------------------------------------------------
+  rate=0.001000  injected=178  delivered=178  failed=0  avg_latency=6.01
+    CPU  attempted=    32  injected=    32  failed=     0  delivered=    32  throughput=0.001600  avg_latency=    5.38  acceptance=1.0000  count=1
+    GPU  attempted=   146  injected=   146  failed=     0  delivered=   146  throughput=0.001825  avg_latency=    6.15  acceptance=1.0000  count=4
+    REQ  attempted=    89  injected=    89  failed=     0  delivered=    89  throughput=0.000890  avg_latency=    5.47
+    RESP attempted=    89  injected=    89  failed=     0  delivered=    89  throughput=0.000890  avg_latency=    6.55
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=89  completed=89  completion_rate=1.0000  avg_completion_latency=12.02
+  rate=0.011000  injected=2079  delivered=2066  failed=0  avg_latency=17.23
+    CPU  attempted=   441  injected=   441  failed=     0  delivered=   441  throughput=0.022050  avg_latency=   11.86  acceptance=1.0000  count=1
+    GPU  attempted=  1638  injected=  1638  failed=     0  delivered=  1625  throughput=0.020313  avg_latency=   18.69  acceptance=1.0000  count=4
+    REQ  attempted=  1045  injected=  1045  failed=     0  delivered=  1034  throughput=0.010340  avg_latency=   14.19
+    RESP attempted=  1034  injected=  1034  failed=     0  delivered=  1032  throughput=0.010320  avg_latency=   20.29
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=1045  completed=1032  completion_rate=0.9876  avg_completion_latency=34.49
+  rate=0.021000  injected=1663  delivered=1583  failed=1043  avg_latency=67.54
+    CPU  attempted=   554  injected=   266  failed=   258  delivered=   264  throughput=0.013200  avg_latency=    7.41  acceptance=0.4801  count=1
+    GPU  attempted=  2182  injected=  1397  failed=   785  delivered=  1319  throughput=0.016487  avg_latency=   79.57  acceptance=0.6402  count=4
+    REQ  attempted=  1943  injected=   884  failed=  1043  delivered=   824  throughput=0.008240  avg_latency=  105.08
+    RESP attempted=   793  injected=   779  failed=     0  delivered=   759  throughput=0.007590  avg_latency=   26.77
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=900  completed=759  completion_rate=0.8433  avg_completion_latency=136.35
+  rate=0.031000  injected=5265  delivered=5169  failed=160  avg_latency=22.04
+    CPU  attempted=  1121  injected=  1111  failed=    10  delivered=  1105  throughput=0.055250  avg_latency=   30.54  acceptance=0.9911  count=1
+    GPU  attempted=  4304  injected=  4154  failed=   150  delivered=  4064  throughput=0.050800  avg_latency=   19.73  acceptance=0.9651  count=4
+    REQ  attempted=  2818  injected=  2658  failed=   160  delivered=  2607  throughput=0.026070  avg_latency=   24.22
+    RESP attempted=  2607  injected=  2607  failed=     0  delivered=  2562  throughput=0.025620  avg_latency=   19.83
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=2658  completed=2562  completion_rate=0.9639  avg_completion_latency=45.42
+
+Scenario: Random Adaptive + Turn Restrictions
+------------------------------------------------------------------------
+  rate=0.001000  injected=180  delivered=180  failed=0  avg_latency=6.05
+    CPU  attempted=    32  injected=    32  failed=     0  delivered=    32  throughput=0.001600  avg_latency=    5.34  acceptance=1.0000  count=1
+    GPU  attempted=   148  injected=   148  failed=     0  delivered=   148  throughput=0.001850  avg_latency=    6.20  acceptance=1.0000  count=4
+    REQ  attempted=    90  injected=    90  failed=     0  delivered=    90  throughput=0.000900  avg_latency=    5.60
+    RESP attempted=    90  injected=    90  failed=     0  delivered=    90  throughput=0.000900  avg_latency=    6.50
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=90  completed=90  completion_rate=1.0000  avg_completion_latency=12.10
+  rate=0.011000  injected=2002  delivered=1980  failed=0  avg_latency=6.64
+    CPU  attempted=   443  injected=   424  failed=     0  delivered=   422  throughput=0.021100  avg_latency=    5.96  acceptance=0.9571  count=1
+    GPU  attempted=  1578  injected=  1578  failed=     0  delivered=  1558  throughput=0.019475  avg_latency=    6.83  acceptance=1.0000  count=4
+    REQ  attempted=  1022  injected=  1011  failed=     0  delivered=   999  throughput=0.009990  avg_latency=    6.16
+    RESP attempted=   999  injected=   991  failed=     0  delivered=   981  throughput=0.009810  avg_latency=    7.14
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=1022  completed=981  completion_rate=0.9599  avg_completion_latency=13.30
+  rate=0.021000  injected=973  delivered=909  failed=1388  avg_latency=6.84
+    CPU  attempted=   559  injected=   208  failed=   325  delivered=   204  throughput=0.010200  avg_latency=    6.13  acceptance=0.3721  count=1
+    GPU  attempted=  1875  injected=   765  failed=  1063  delivered=   705  throughput=0.008812  avg_latency=    7.05  acceptance=0.4080  count=4
+    REQ  attempted=  1954  injected=   538  failed=  1388  delivered=   486  throughput=0.004860  avg_latency=    6.54
+    RESP attempted=   480  injected=   435  failed=     0  delivered=   423  throughput=0.004230  avg_latency=    7.20
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=566  completed=423  completion_rate=0.7473  avg_completion_latency=13.78
+  rate=0.031000  injected=1190  delivered=1137  failed=2190  avg_latency=7.73
+    CPU  attempted=   748  injected=   221  failed=   499  delivered=   217  throughput=0.010850  avg_latency=    6.94  acceptance=0.2955  count=1
+    GPU  attempted=  2719  injected=   969  failed=  1691  delivered=   920  throughput=0.011500  avg_latency=    7.91  acceptance=0.3564  count=4
+    REQ  attempted=  2899  injected=   660  failed=  2190  delivered=   629  throughput=0.006290  avg_latency=    7.59
+    RESP attempted=   568  injected=   530  failed=     0  delivered=   508  throughput=0.005080  avg_latency=    7.90
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=709  completed=508  completion_rate=0.7165  avg_completion_latency=15.34
+
+Scenario: Shortest Path (40 VCs)
+------------------------------------------------------------------------
+  rate=0.001000  injected=180  delivered=180  failed=0  avg_latency=6.16
+    CPU  attempted=    36  injected=    36  failed=     0  delivered=    36  throughput=0.001800  avg_latency=    5.53  acceptance=1.0000  count=1
+    GPU  attempted=   144  injected=   144  failed=     0  delivered=   144  throughput=0.001800  avg_latency=    6.31  acceptance=1.0000  count=4
+    REQ  attempted=    90  injected=    90  failed=     0  delivered=    90  throughput=0.000900  avg_latency=    5.67
+    RESP attempted=    90  injected=    90  failed=     0  delivered=    90  throughput=0.000900  avg_latency=    6.64
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=90  completed=90  completion_rate=1.0000  avg_completion_latency=12.31
+  rate=0.011000  injected=1980  delivered=1980  failed=0  avg_latency=6.63
+    CPU  attempted=   424  injected=   424  failed=     0  delivered=   424  throughput=0.021200  avg_latency=    5.78  acceptance=1.0000  count=1
+    GPU  attempted=  1556  injected=  1556  failed=     0  delivered=  1556  throughput=0.019450  avg_latency=    6.86  acceptance=1.0000  count=4
+    REQ  attempted=   990  injected=   990  failed=     0  delivered=   990  throughput=0.009900  avg_latency=    6.16
+    RESP attempted=   990  injected=   990  failed=     0  delivered=   990  throughput=0.009900  avg_latency=    7.09
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=990  completed=990  completion_rate=1.0000  avg_completion_latency=13.26
+  rate=0.021000  injected=3822  delivered=3814  failed=0  avg_latency=7.20
+    CPU  attempted=   798  injected=   798  failed=     0  delivered=   796  throughput=0.039800  avg_latency=    6.23  acceptance=1.0000  count=1
+    GPU  attempted=  3024  injected=  3024  failed=     0  delivered=  3018  throughput=0.037725  avg_latency=    7.46  acceptance=1.0000  count=4
+    REQ  attempted=  1913  injected=  1913  failed=     0  delivered=  1909  throughput=0.019090  avg_latency=    6.79
+    RESP attempted=  1909  injected=  1909  failed=     0  delivered=  1905  throughput=0.019050  avg_latency=    7.62
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=1913  completed=1905  completion_rate=0.9958  avg_completion_latency=14.42
+  rate=0.031000  injected=5642  delivered=5624  failed=0  avg_latency=7.61
+    CPU  attempted=  1174  injected=  1174  failed=     0  delivered=  1172  throughput=0.058600  avg_latency=    6.42  acceptance=1.0000  count=1
+    GPU  attempted=  4468  injected=  4468  failed=     0  delivered=  4452  throughput=0.055650  avg_latency=    7.92  acceptance=1.0000  count=4
+    REQ  attempted=  2826  injected=  2826  failed=     0  delivered=  2816  throughput=0.028160  avg_latency=    7.20
+    RESP attempted=  2816  injected=  2816  failed=     0  delivered=  2808  throughput=0.028080  avg_latency=    8.01
+    DATA attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    CTRL attempted=     0  injected=     0  failed=     0  delivered=     0  throughput=0.000000  avg_latency=    0.00
+    transactions started=2826  completed=2808  completion_rate=0.9936  avg_completion_latency=15.23
