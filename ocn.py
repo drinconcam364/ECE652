@@ -47,6 +47,7 @@ DRAIN_ESCAPE_ENTRY_PROB           = 0.1
 TURN_RESTRICTED_ESCAPE_ENTRY_PROB = 0.1
 ESCAPE_ENTRY_PROB  = DRAIN_ESCAPE_ENTRY_PROB  # default for single-mesh runs
 DRAIN_PERIOD       =  500
+stagger_drain = 1
 DRAIN_WINDOW_HOPS  = 1
 PRE_DRAIN_CYCLES   = 1 # FLITS_PER_PACKET # paper says -  maximum packet size supported in the networ
 FULL_DRAIN_EVERY_N_WINDOWS = 20   # perform a full drain once every N regular drain windows
@@ -55,7 +56,7 @@ INJECTION_RATE     = .025#0.006
 
 COOLDOWN_CYCLES = 10000   # injection-free cycles appended after each run
 
-DRAIN_DEBUG_PRINTS = True
+DRAIN_DEBUG_PRINTS = False
 DRAIN_DEBUG_PRINT_PERIOD = 200
 
 # ─── Chiplet type identifiers ─────────────────────────────────────────────────
@@ -73,6 +74,7 @@ GPU_BURST_RATE       = 4 * CPU_INJECTION_RATE            # ~8× CPU rate during 
 GPU_QUIET_RATE       = CPU_INJECTION_RATE/10            # near-idle between bursts
 GPU_BURST_CYCLES     = 20              # cycles per burst
 GPU_QUIET_CYCLES     = 80              # quiet cycles between bursts
+
 
 # ─── Routing algorithm identifiers ────────────────────────────────────────────
 
@@ -3078,7 +3080,7 @@ def sweep_injection_rates(
     protocol_config:    Optional[ProtocolConfig] = None,
     num_seeds:          int   = 5,
     drain_period_c:     Optional[float] = 0.2,
-    drain_period_alpha: float           = 2.0,
+    drain_period_alpha: float           = 1.0,
 ) -> Dict[str, Dict[float, Dict[str, Any]]]:
     """
     Sweep CPU INJECTION_RATE and collect packet counts per scenario.
@@ -3116,8 +3118,8 @@ def sweep_injection_rates(
     total = len(rates)
     for idx, rate in enumerate(rates):
         effective_drain_period = (
-            max(1, round(drain_period_c / (rate ** drain_period_alpha)))
-            if drain_period_c is not None
+            max(1, round((drain_period_c / (rate ** drain_period_alpha))*2))
+            if drain_period_c is not None and stagger_drain == 1
             else drain_period
         )
         # effective_drain_period = drain_period
@@ -3231,6 +3233,7 @@ def sweep_injection_rates(
                 "delivered":         int(round(accum[label]["delivered"]         / num_seeds)),
                 "failed_injections": int(round(accum[label]["failed_injections"] / num_seeds)),
                 "avg_latency":       accum[label]["avg_latency"] / num_seeds,
+                "drain_period":      int(effective_drain_period),
             }
             averaged_stats["per_type"] = {}
             for chiplet_type in (CHIPLET_CPU, CHIPLET_GPU):
@@ -3941,6 +3944,204 @@ def plot_latency_sweep_all_scenarios(
     plt.close(fig)
 
 
+def plot_transaction_completion_sweep_all_scenarios(
+    sweep: Dict[str, Dict[float, Dict[str, Any]]],
+    out_prefix: str = "injection_rate_sweep",
+    show: bool = True,
+) -> None:
+    """Plot INJECTION_RATE vs transaction completion rate for all scenarios."""
+    import os
+    import tempfile
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams.update({"font.size": 12})
+
+    available_labels = [
+        label for label in SCENARIO_LABELS
+        if label in sweep
+        and any("transactions" in sweep[label][rate] for rate in sweep[label])
+    ]
+    if not available_labels:
+        return
+
+    all_sweep_rates = [r for label in available_labels for r in sweep[label].keys()]
+    x_min = min(all_sweep_rates)
+    x_max = max(all_sweep_rates)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    colors = ["mediumpurple", "seagreen", "steelblue", "darkorange", "slategray", "firebrick"]
+    markers = ["P", "^", "s", "o", "x", "D"]
+    for label, color, marker in zip(available_labels, colors, markers):
+        rates = sorted(sweep[label].keys())
+        completion_rates = [
+            float(
+                sweep[label][rate]
+                .get("transactions", {})
+                .get("completion_rate", 0.0)
+            )
+            for rate in rates
+        ]
+        ax.plot(
+            rates,
+            completion_rates,
+            marker=marker,
+            linewidth=2,
+            color=color,
+            label=SCENARIO_DISPLAY.get(label, label),
+        )
+
+    ax.set_xlabel("INJECTION_RATE")
+    ax.set_ylabel("Transaction Completion Rate")
+    ax.set_title("Scenario Comparison\nTransaction Completion Rate vs INJECTION_RATE")
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+
+    out_file = f"{out_prefix}_transaction_completion_all_scenarios.png"
+    fig.savefig(out_file, dpi=150)
+    print(f"  Saved: {out_file}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_req_resp_latency_sweep_all_scenarios(
+    sweep: Dict[str, Dict[float, Dict[str, Any]]],
+    out_prefix: str = "injection_rate_sweep",
+    show: bool = True,
+) -> None:
+    """Plot INJECTION_RATE vs REQ/RESP average latency for all scenarios."""
+    import os
+    import tempfile
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams.update({"font.size": 12})
+
+    available_labels = [
+        label for label in SCENARIO_LABELS
+        if label in sweep
+        and any("per_message_class" in sweep[label][rate] for rate in sweep[label])
+    ]
+    if not available_labels:
+        return
+
+    all_sweep_rates = [r for label in available_labels for r in sweep[label].keys()]
+    x_min = min(all_sweep_rates)
+    x_max = max(all_sweep_rates)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    base_colors = {
+        "xy": "mediumpurple",
+        "yx": "seagreen",
+        "random_adaptive_without_drain": "steelblue",
+        "random_adaptive_with_drain": "darkorange",
+        "random_adaptive_turn_restricted": "slategray",
+        "shortest_path": "firebrick",
+    }
+    markers = {
+        "xy": "P",
+        "yx": "^",
+        "random_adaptive_without_drain": "s",
+        "random_adaptive_with_drain": "o",
+        "random_adaptive_turn_restricted": "x",
+        "shortest_path": "D",
+    }
+
+    plotted_any = False
+    for label in available_labels:
+        rates = sorted(sweep[label].keys())
+        req_latency = [
+            float(
+                sweep[label][rate]
+                .get("per_message_class", {})
+                .get(MESSAGE_CLASS_REQ, {})
+                .get("avg_latency", 0.0)
+            )
+            for rate in rates
+        ]
+        resp_latency = [
+            float(
+                sweep[label][rate]
+                .get("per_message_class", {})
+                .get(MESSAGE_CLASS_RESP, {})
+                .get("avg_latency", 0.0)
+            )
+            for rate in rates
+        ]
+        req_delivered = [
+            int(
+                sweep[label][rate]
+                .get("per_message_class", {})
+                .get(MESSAGE_CLASS_REQ, {})
+                .get("delivered", 0)
+            )
+            for rate in rates
+        ]
+        resp_delivered = [
+            int(
+                sweep[label][rate]
+                .get("per_message_class", {})
+                .get(MESSAGE_CLASS_RESP, {})
+                .get("delivered", 0)
+            )
+            for rate in rates
+        ]
+
+        color = base_colors.get(label, "black")
+        marker = markers.get(label, "o")
+        display = SCENARIO_DISPLAY.get(label, label)
+
+        if any(req_delivered):
+            plotted_any = True
+            ax.plot(
+                rates,
+                req_latency,
+                marker=marker,
+                linewidth=2,
+                color=color,
+                label=f"{display} – REQ",
+            )
+        if any(resp_delivered):
+            plotted_any = True
+            ax.plot(
+                rates,
+                resp_latency,
+                marker=marker,
+                linewidth=2,
+                linestyle="--",
+                color=color,
+                alpha=0.9,
+                label=f"{display} – RESP",
+            )
+
+    if not plotted_any:
+        plt.close(fig)
+        return
+
+    ax.set_xlabel("INJECTION_RATE")
+    ax.set_ylabel("Avg Packet Latency (cycles)")
+    ax.set_title("Scenario Comparison\nREQ vs RESP Avg Latency vs INJECTION_RATE")
+    ax.set_xlim(x_min, x_max)
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+
+    out_file = f"{out_prefix}_req_resp_latency_all_scenarios.png"
+    fig.savefig(out_file, dpi=150)
+    print(f"  Saved: {out_file}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 def write_injection_sweep_summary_text(
     sweep: Dict[str, Dict[float, Dict[str, Any]]],
     out_file: str = "injection_rate_sweep_summary.txt",
@@ -3981,12 +4182,13 @@ def write_injection_sweep_summary_text(
             stats = sweep[label][rate]
             lines.append(
                 "  rate={rate:.6f}  injected={injected}  delivered={delivered}  "
-                "failed={failed}  avg_latency={avg_latency:.2f}".format(
+                "failed={failed}  avg_latency={avg_latency:.2f}  drain_period={drain_period}".format(
                     rate=rate,
                     injected=int(stats.get("injected", 0)),
                     delivered=int(stats.get("delivered", 0)),
                     failed=int(stats.get("failed_injections", 0)),
                     avg_latency=float(stats.get("avg_latency", 0.0)),
+                    drain_period=int(stats.get("drain_period", DRAIN_PERIOD)),
                 )
             )
             per_type = stats.get("per_type", {})
@@ -4415,22 +4617,32 @@ if __name__ == "__main__":
         chiplet_specs=specs,
         cycles=20000,
         rate_min=0.001,
-        rate_max=0.031, #0.031,
-        rate_step=0.01,
-        seed=23, # 42,
+        rate_max=0.033, #0.031,
+        rate_step=0.008,
+        seed=42, # 42,
         routing_seed=0,
-        num_seeds=1,
+        num_seeds=4,
     )
     print("Generating sweep plots ...")
     plot_injection_sweep(sweep, out_prefix=out_prefix, show=False)
     plot_latency_sweep_all_scenarios(sweep, out_prefix=out_prefix, show=False)
+    plot_transaction_completion_sweep_all_scenarios(
+        sweep,
+        out_prefix=out_prefix,
+        show=False,
+    )
+    plot_req_resp_latency_sweep_all_scenarios(
+        sweep,
+        out_prefix=out_prefix,
+        show=False,
+    )
     text_out_file = f"{out_prefix}_summary.txt"
     write_injection_sweep_summary_text(
         sweep,
         out_file=text_out_file,
     )
     
-    plot_message_class_sweep(sweep, scenario_label = "random_adaptive_with_drain", out_prefix = out_prefix, show=True)
+    plot_message_class_sweep(sweep, scenario_label = "random_adaptive_with_drain", out_prefix = out_prefix, show=False)
     print()
 
 
