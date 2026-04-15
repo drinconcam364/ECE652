@@ -360,6 +360,24 @@ class Link:
     latency: int = 1
 
 
+@dataclass(frozen=True)
+class DrainTurnBinding:
+    """
+    One static DRAIN turn-table entry.
+
+    The binding is keyed by the source router and the input port whose escape
+    VC currently holds the head flit. It specifies the unique output direction
+    that port must use during a DRAIN shift, along with the exact successor
+    router/input-port pair reached by that move.
+    """
+
+    src_router: str
+    src_input_port: str
+    out_dir: str
+    dst_router: str
+    dst_input_port: str
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Virtual Channel (VC)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1060,11 +1078,15 @@ class InterposerMesh:
             chiplet_name: _zero_message_class_map()
             for chiplet_name in self.chiplets.keys()
         }
-        self._drain_cycle: List[str] = self._compute_drain_cycle()
-        self._drain_next: Dict[str, str] = {
-            self._drain_cycle[i]: self._drain_cycle[(i + 1) % len(self._drain_cycle)]
-            for i in range(len(self._drain_cycle))
-        }
+        self._drain_turn_cycle: List[DrainTurnBinding] = []
+        self._drain_turn_table: Dict[Tuple[str, str], DrainTurnBinding] = {}
+        if self.drain_enabled:
+            self._drain_turn_cycle = self._compute_standard_drain_turn_cycle()
+            self._drain_turn_table = {
+                (binding.src_router, binding.src_input_port): binding
+                for binding in self._drain_turn_cycle
+            }
+            self._validate_drain_turn_table()
 
     # ── ID helpers ────────────────────────────────────────────────────────────
 
@@ -1163,10 +1185,150 @@ class InterposerMesh:
                 return d
         return None
 
+    def _validate_standard_drain_mesh(self) -> None:
+        """
+        Ensure the topology matches the standard fault-free 4x4 interposer mesh.
+
+        The first per-port full-shift DRAIN implementation intentionally targets
+        only the fully connected 4x4 mesh. Faulted topologies or other mesh
+        sizes must not silently fall back to a weaker drain model.
+        """
+        if self.rows != 4 or self.cols != 4:
+            raise ValueError(
+                "Per-port DRAIN currently supports only the standard fault-free 4x4 mesh."
+            )
+
+        for r in range(self.rows):
+            for c in range(self.cols):
+                rid = self.router_id(r, c)
+                router = self.routers[rid]
+                expected_neighbors = {
+                    "N": self.router_id(r - 1, c) if r > 0 else None,
+                    "S": self.router_id(r + 1, c) if r < self.rows - 1 else None,
+                    "E": self.router_id(r, c + 1) if c < self.cols - 1 else None,
+                    "W": self.router_id(r, c - 1) if c > 0 else None,
+                }
+                if router.ir_neighbors != expected_neighbors:
+                    raise ValueError(
+                        "Per-port DRAIN currently supports only the standard fault-free 4x4 mesh."
+                    )
+
+    def _directed_inter_router_edges(self) -> List[Tuple[str, str, str]]:
+        """Return every directed cardinal inter-router channel exactly once."""
+        edges: List[Tuple[str, str, str]] = []
+        for rid in sorted(self.routers.keys()):
+            router = self.routers[rid]
+            for out_dir in ("N", "E", "S", "W"):
+                dst_rid = router.ir_neighbors.get(out_dir)
+                if dst_rid is not None:
+                    edges.append((rid, out_dir, dst_rid))
+        return edges
+
+    def _compute_standard_drain_turn_cycle(self) -> List[DrainTurnBinding]:
+        """
+        Compute one deterministic cycle over all directed inter-router channels.
+
+        The cycle is built once at construction time and reused for every drain
+        window. Each directed channel corresponds to one bound input port at its
+        destination router, giving a per-input-port drain turn-table.
+        """
+        self._validate_standard_drain_mesh()
+
+        outgoing: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
+        for src_rid, out_dir, dst_rid in self._directed_inter_router_edges():
+            outgoing[src_rid].append((src_rid, out_dir, dst_rid))
+
+        direction_order = {"N": 0, "E": 1, "S": 2, "W": 3}
+        for rid in outgoing:
+            outgoing[rid].sort(key=lambda edge: direction_order[edge[1]])
+
+        edge_cycle_reversed: List[Tuple[str, str, str]] = []
+
+        def dfs(src_rid: str) -> None:
+            while outgoing[src_rid]:
+                edge = outgoing[src_rid].pop(0)
+                dfs(edge[2])
+                edge_cycle_reversed.append(edge)
+
+        start_rid = self.router_id(0, 0)
+        dfs(start_rid)
+        edge_cycle = list(reversed(edge_cycle_reversed))
+        expected_edge_count = len(self._directed_inter_router_edges())
+        if len(edge_cycle) != expected_edge_count:
+            raise ValueError(
+                "Failed to build a complete per-port DRAIN cycle for the 4x4 mesh."
+            )
+
+        bindings: List[DrainTurnBinding] = []
+        edge_count = len(edge_cycle)
+        for idx, (src_rid, out_dir, dst_rid) in enumerate(edge_cycle):
+            nxt_src_rid, nxt_out_dir, nxt_dst_rid = edge_cycle[(idx + 1) % edge_count]
+            if dst_rid != nxt_src_rid:
+                raise ValueError("Drain edge cycle is not closed correctly.")
+            src_input_port = self.OPPOSITE_DIR[out_dir]
+            dst_input_port = self.OPPOSITE_DIR[nxt_out_dir]
+            bindings.append(
+                DrainTurnBinding(
+                    src_router=dst_rid,
+                    src_input_port=src_input_port,
+                    out_dir=nxt_out_dir,
+                    dst_router=nxt_dst_rid,
+                    dst_input_port=dst_input_port,
+                )
+            )
+        return bindings
+
+    def _validate_drain_turn_table(self) -> None:
+        """Sanity-check the static per-port drain turn-table."""
+        if not self._drain_turn_cycle:
+            raise ValueError("Per-port DRAIN requires a non-empty drain turn-table.")
+
+        directed_edges = self._directed_inter_router_edges()
+        expected_keys = {
+            (dst_rid, self.OPPOSITE_DIR[out_dir])
+            for src_rid, out_dir, dst_rid in directed_edges
+        }
+        actual_keys = set(self._drain_turn_table.keys())
+        if actual_keys != expected_keys:
+            raise ValueError("Per-port DRAIN turn-table does not cover all directed channels.")
+
+        for binding in self._drain_turn_cycle:
+            router = self.routers[binding.src_router]
+            if binding.src_input_port not in ("N", "S", "E", "W"):
+                raise ValueError("Drain turn-table must bind only cardinal input ports.")
+            dst_neighbor = router.ir_neighbors.get(binding.out_dir)
+            if dst_neighbor != binding.dst_router:
+                raise ValueError("Drain turn-table references a non-neighbor drain output.")
+            if self.OPPOSITE_DIR[binding.out_dir] != binding.dst_input_port:
+                raise ValueError("Drain turn-table destination input port is inconsistent.")
+
+        router_outputs: Dict[str, Dict[str, str]] = defaultdict(dict)
+        for binding in self._drain_turn_cycle:
+            prev = router_outputs[binding.src_router].get(binding.src_input_port)
+            if prev is not None and prev != binding.out_dir:
+                raise ValueError("Drain turn-table contains duplicate bindings for an input port.")
+            router_outputs[binding.src_router][binding.src_input_port] = binding.out_dir
+
+        for rid, mapping in router_outputs.items():
+            if len(set(mapping.values())) != len(mapping):
+                raise ValueError(
+                    f"Drain turn-table does not assign distinct outputs per input port at {rid}."
+                )
+
+        cycle_len = len(self._drain_turn_cycle)
+        for idx, binding in enumerate(self._drain_turn_cycle):
+            next_binding = self._drain_turn_cycle[(idx + 1) % cycle_len]
+            if binding.dst_router != next_binding.src_router:
+                raise ValueError("Drain turn-table cycle is not globally closed.")
+            if binding.dst_input_port != next_binding.src_input_port:
+                raise ValueError("Drain turn-table cycle does not match successor input ports.")
+
     def _compute_drain_cycle(self) -> List[str]:
         """
-        Offline computation of a Hamiltonian cycle over the interposer routers.
-        Escape-VC packets follow this cycle during DRAIN windows.
+        Legacy router-level drain-cycle helper retained for reference.
+
+        Active DRAIN behavior now uses the static per-port drain turn-table
+        built by ``_compute_standard_drain_turn_cycle()`` instead.
         """
         nodes = list(self.routers.keys())
         if not nodes:
@@ -1211,9 +1373,11 @@ class InterposerMesh:
         Randomly disable ``num_faults`` bidirectional links on the interposer.
 
         Each fault removes one undirected edge by setting ``ir_neighbors`` to
-        ``None`` in both endpoint routers.  Afterwards the drain Hamiltonian
-        cycle is recomputed on the surviving topology so DRAIN windows can
-        still make progress wherever connectivity allows.
+        ``None`` in both endpoint routers.
+
+        The current per-port DRAIN implementation is intentionally limited to
+        the standard fault-free 4x4 mesh, so DRAIN-enabled fault injection is
+        rejected explicitly rather than silently falling back to a weaker path.
 
         Parameters
         ----------
@@ -1224,6 +1388,12 @@ class InterposerMesh:
         -------
         List of (rid_a, rid_b) pairs for the disabled edges.
         """
+        if self.drain_enabled and num_faults > 0:
+            raise NotImplementedError(
+                "Per-port DRAIN currently supports only the standard fault-free 4x4 mesh; "
+                "DRAIN-enabled fault injection is not implemented."
+            )
+
         # Collect all undirected edges once.
         edges: List[Tuple[str, str, str]] = []  # (rid_a, rid_b, dir_a→b)
         seen: set = set()
@@ -1250,13 +1420,6 @@ class InterposerMesh:
             self.routers[rid_a].ir_neighbors[dir_a] = None
             self.routers[rid_b].ir_neighbors[dir_b] = None
             disabled.append((rid_a, rid_b))
-
-        # Recompute drain cycle on the surviving topology.
-        self._drain_cycle = self._compute_drain_cycle()
-        self._drain_next = {
-            self._drain_cycle[i]: self._drain_cycle[(i + 1) % len(self._drain_cycle)]
-            for i in range(len(self._drain_cycle))
-        }
         return disabled
 
     def _drain_active(self) -> bool:
@@ -1304,7 +1467,7 @@ class InterposerMesh:
             return
         self._drain_window_count += 1
         if self._drain_window_count % self.full_drain_every_n_windows == 0:
-            self._full_drain_hops_remaining = len(self._drain_cycle)
+            self._full_drain_hops_remaining = len(self._drain_turn_cycle)
             self._drain_hops_remaining = 0
             self._set_drain_mode(DRAIN_MODE_FULL_DRAIN)
             self._print_drain_debug(
@@ -1347,86 +1510,105 @@ class InterposerMesh:
         if cycle > 0 and cycle % self.drain_period == 0:
             self._begin_pre_drain(cycle)
 
+    def _drain_dest_can_accept(
+        self,
+        binding: DrainTurnBinding,
+        departing_ports: set,
+    ) -> bool:
+        """
+        Check whether one synchronized DRAIN shift may push into the successor
+        escape VC under the current split-based approximation.
+        """
+        dst_esc = self.routers[binding.dst_router].input_ports[binding.dst_input_port].escape_vc
+        dst_key = (binding.dst_router, binding.dst_input_port)
+        dst_departs = dst_key in departing_ports
+
+        projected_occ = dst_esc.occupancy() - (1 if dst_departs else 0)
+        if projected_occ < 0 or projected_occ >= dst_esc.capacity:
+            return False
+
+        if dst_esc.allocated_flow_id is None or dst_esc.is_empty():
+            return True
+
+        if not dst_departs:
+            return False
+
+        # Preserve the current VC-lock approximation: an incoming singleton may
+        # reuse the destination escape VC only when that VC empties completely.
+        return dst_esc.occupancy() == 1
+
     def _perform_regular_drain_hop(self, cycle: int) -> int:
         """
-        Move escape-domain flits during a regular DRAIN window using
-        output-port arbitration.
+        Perform one globally synchronized per-port DRAIN shift stage.
 
-        Every input-port escape VC that has a head flit may request the router's
-        drain-path output port. At most one winner is selected per output port
-        (matching the normal forwarding model), then all winners are checked
-        against downstream escape-VC availability and committed simultaneously.
-
-        The current offline drain cycle assigns one drain-next router per
-        source router, so all escape requests within one router typically
-        contend for the same output port. This helper still removes the older
-        "first input port only" shortcut and keeps arbitration output-centric.
-        
-        
-        
+        Every cardinal input-port escape VC covered by the static drain
+        turn-table may advance simultaneously through its bound output,
+        subject to downstream escape-VC availability.
         """
-        if not self._drain_cycle:
+        if not self._drain_turn_cycle:
             return 0
 
-        # For each router input port that has an escape flit, build a request
-        # for that router's drain-path output port.
-        output_groups: Dict[Tuple[str, str], List[Tuple[str, str, str, str]]] = defaultdict(list)
-        candidate_count = 0
-        for src_rid, router in self.routers.items():
-            dst_rid = self._drain_next.get(src_rid)
-            if dst_rid is None:
-                continue
-            out_dir = self._direction_to(src_rid, dst_rid)
-            if out_dir is None:
-                continue
-            dst_port_name = self.OPPOSITE_DIR[out_dir]
-            for src_port_name, port in router.input_ports.items():
-                if not port.has_escape_flit():
-                    continue
-                output_groups[(src_rid, out_dir)].append(
-                    (src_rid, src_port_name, dst_rid, dst_port_name)
+        for rid, router in self.routers.items():
+            if router.input_ports["Down"].has_escape_flit():
+                raise AssertionError(
+                    "Per-port DRAIN assumes Down.escape_vc remains empty; Down is used only for ejection."
                 )
-                candidate_count += 1
 
-        if candidate_count == 0:
+        candidates: List[DrainTurnBinding] = []
+        departing_ports: set = set()
+        for binding in self._drain_turn_cycle:
+            src_port = self.routers[binding.src_router].input_ports[binding.src_input_port]
+            if not src_port.has_escape_flit():
+                continue
+            flit = src_port.escape_vc.peek()
+            if flit is None:
+                continue
+            dst_br_id = flit.parent_packet.dst_boundary_router
+            dst_ir_id = self.boundary_routers[dst_br_id].attached_ir  # type: ignore[index]
+            if binding.src_router == dst_ir_id:
+                continue
+            candidates.append(binding)
+            departing_ports.add((binding.src_router, binding.src_input_port))
+
+        if not candidates:
             return 0
 
-        # Arbitrate one winner per output port.
-        winners: List[Tuple[str, str, str, str]] = []
-        for _output_key, candidates in output_groups.items():
-            winners.append(self._routing_rng.choice(candidates))
+        # A destination port can only be treated as freeing one slot if its
+        # own source-side move is also part of the synchronized shift. Start
+        # from the optimistic candidate set and prune until the movable set is
+        # self-consistent.
+        movable = list(candidates)
+        while True:
+            movable_departures = {
+                (binding.src_router, binding.src_input_port)
+                for binding in movable
+            }
+            new_movable = [
+                binding
+                for binding in candidates
+                if self._drain_dest_can_accept(binding, movable_departures)
+            ]
+            if len(new_movable) == len(movable) and all(
+                a is b for a, b in zip(new_movable, movable)
+            ):
+                break
+            movable = new_movable
 
-        # Determine which winners can actually advance based on downstream
-        # escape-VC capacity/allocation.
-        # dst_port_name = OPPOSITE_DIR[out_dir] where out_dir = direction to drain-next.
-        will_depart_rids = {src_rid for src_rid, _, _, _ in winners}
-        movable: List[Tuple[str, str, str, str]] = []
-        for src_rid, src_port_name, dst_rid, dst_port_name in winners:
-            dst_esc = self.routers[dst_rid].input_ports[dst_port_name].escape_vc
-            # Account for a flit that may itself depart from dst this cycle.
-            projected_occ = dst_esc.occupancy() - (1 if dst_rid in will_depart_rids else 0)
-            dst_free = projected_occ < dst_esc.capacity
-            dst_free_alloc = (
-                dst_esc.allocated_flow_id is None
-                or dst_rid in will_depart_rids
-            )
-            if dst_free and dst_free_alloc:
-                movable.append((src_rid, src_port_name, dst_rid, dst_port_name))
+        staged: List[Tuple[DrainTurnBinding, Flit]] = []
+        for binding in movable:
+            src_esc = self.routers[binding.src_router].input_ports[binding.src_input_port].escape_vc
+            staged.append((binding, src_esc.pop()))
 
-        # Stage pops before committing.
-        staged: List[Tuple[str, str, str, str, Flit]] = []
-        for src_rid, src_port_name, dst_rid, dst_port_name in movable:
-            src_esc = self.routers[src_rid].input_ports[src_port_name].escape_vc
-            flit = src_esc.pop()
-            staged.append((src_rid, src_port_name, dst_rid, dst_port_name, flit))
-
+        # Phase 1: finalize all source-side split/retag state before any
+        # destination VC receives a new flit. This preserves the intended
+        # globally synchronized shift semantics when a VC is both a source and
+        # a destination in the same DRAIN cycle.
         moves = 0
-        for src_rid, src_port_name, dst_rid, dst_port_name, flit in staged:
-            src_router = self.routers[src_rid]
-            src_esc = src_router.input_ports[src_port_name].escape_vc
+        for binding, flit in staged:
+            src_router = self.routers[binding.src_router]
+            src_esc = src_router.input_ports[binding.src_input_port].escape_vc
             old_flow = flit.flow_id
 
-            # ── DRAIN split: remaining flits of same flow in source escape VC ─
             remaining = [f for f in src_esc.fifo_queue if f.flow_id == old_flow]
             if remaining:
                 new_flow_src = self._alloc_flow_id()
@@ -1438,28 +1620,91 @@ class InterposerMesh:
                 src_esc.allocated_flow_id = new_flow_src
                 src_router.flow_output_table.pop(old_flow, None)
 
-            # ── Moved flit becomes a fresh solo worm at the destination ────
+        # Phase 2: commit all destination pushes after every source VC has been
+        # updated for this synchronized shift step.
+        for binding, flit in staged:
             new_flow_dst = self._alloc_flow_id()
             flit.flow_id = new_flow_dst
             flit.is_worm_head = True
             flit.is_worm_tail = True
             flit.in_escape_vc = True
 
-            dst_esc = self.routers[dst_rid].input_ports[dst_port_name].escape_vc
-            dst_esc.push(flit)
-            flit.parent_packet.current_node = dst_rid
+            dst_esc = self.routers[binding.dst_router].input_ports[binding.dst_input_port].escape_vc
+            if not dst_esc.push(flit):
+                raise AssertionError(
+                    "Synchronized DRAIN commit violated escape-VC capacity/allocation: "
+                    f"{binding.src_router}.{binding.src_input_port} -> "
+                    f"{binding.dst_router}.{binding.dst_input_port}"
+                )
+            flit.parent_packet.current_node = binding.dst_router
             if flit.flit_idx == 0:
                 flit.parent_packet.hops += 1
             moves += 1
 
-        blocked = candidate_count - len(movable)
+        blocked = len(candidates) - len(movable)
         self._print_drain_debug(
             cycle,
-            f"regular_drain_hop: candidates={candidate_count} winners={len(winners)} "
-            f"forwarded={len(movable)} blocked={blocked}",
-            force = True
+            f"regular_drain_hop: candidates={len(candidates)} forwarded={len(movable)} blocked={blocked}",
+            force=True,
         )
 
+        return moves
+
+    def _perform_drain_ejection_stage(self, cycle: int) -> int:
+        """
+        Perform one synchronized drain-ejection stage through router Down outputs.
+
+        At most one escape flit may eject per router in this stage.
+        """
+        candidates_by_router: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        for rid, router in self.routers.items():
+            for port_name, port in router.input_ports.items():
+                flit = port.escape_vc.peek()
+                if flit is None:
+                    continue
+                dst_br_id = flit.parent_packet.dst_boundary_router
+                dst_ir_id = self.boundary_routers[dst_br_id].attached_ir  # type: ignore[index]
+                if rid == dst_ir_id:
+                    candidates_by_router[rid].append((rid, port_name))
+
+        if not candidates_by_router:
+            return 0
+
+        winners: List[Tuple[str, str]] = []
+        for rid, candidates in candidates_by_router.items():
+            eligible = []
+            for candidate in candidates:
+                port_name = candidate[1]
+                flit = self.routers[rid].input_ports[port_name].escape_vc.peek()
+                if flit is not None and self._can_start_packet_ejection(flit.parent_packet):
+                    eligible.append(candidate)
+            if eligible:
+                winners.append(self._routing_rng.choice(eligible))
+
+        staged: List[Tuple[str, str, Packet]] = []
+        for rid, port_name in winners:
+            flit = self.routers[rid].input_ports[port_name].escape_vc.peek()
+            if flit is None:
+                continue
+            pkt = flit.parent_packet
+            if self._reserve_packet_ejection(pkt):
+                staged.append((rid, port_name, pkt))
+
+        moves = 0
+        for rid, port_name, pkt in staged:
+            esc = self.routers[rid].input_ports[port_name].escape_vc
+            esc.pop()
+            pkt.flits_delivered += 1
+            if pkt.flits_delivered == FLITS_PER_PACKET:
+                self._finalize_packet_delivery(pkt, cycle)
+            moves += 1
+
+        self._print_drain_debug(
+            cycle,
+            f"drain_ejection_stage: candidates={sum(len(v) for v in candidates_by_router.values())} "
+            f"ejected={moves}",
+            force=True,
+        )
         return moves
 
     # ── routing ───────────────────────────────────────────────────────────────
@@ -2123,8 +2368,9 @@ class InterposerMesh:
                     outbound queue have ``in_escape_vc`` set to True so they
                     follow the header into the escape path.
 
-        Phase 2a – Synchronized DRAIN circulation for escape-VC flits
-                   (only when a DRAIN window is active).
+        Phase 2a – One globally synchronized per-port DRAIN shift stage for
+                   escape-VC flits, followed by a same-cycle drain ejection
+                   stage through ``Down`` when a DRAIN window is active.
 
         Phase 2b – Normal flit forwarding through the interposer.
 
@@ -2143,31 +2389,13 @@ class InterposerMesh:
         self._advance_drain_fsm(cycle)
 
         # ── Full drain: freeze injection + normal-VC forwarding ───────────
-        # During a full drain the Hamiltonian cycle runs one hop per cycle
-        # until every escape-VC flit has visited all routers and can eject.
+        # During a full drain, one globally synchronized per-port DRAIN shift
+        # stage runs per cycle, followed by a same-cycle drain ejection stage.
         if self._full_drain_active():
             hop_moves = self._perform_regular_drain_hop(cycle)
-            moves += hop_moves
+            ejected = self._perform_drain_ejection_stage(cycle)
+            moves += hop_moves + ejected
             self._full_drain_hops_remaining -= 1
-            # Eject escape flits sitting at their destination IR.
-            ejected = 0
-            for rid, router in self.routers.items():
-                for port in router.input_ports.values():
-                    flit = port.escape_vc.peek()
-                    if flit is None:
-                        continue
-                    dst_br_id = flit.parent_packet.dst_boundary_router
-                    dst_ir_id = self.boundary_routers[dst_br_id].attached_ir  # type: ignore[index]
-                    if rid == dst_ir_id:
-                        pkt = flit.parent_packet
-                        if not self._reserve_packet_ejection(pkt):
-                            continue
-                        port.escape_vc.pop()
-                        pkt.flits_delivered += 1
-                        if pkt.flits_delivered == FLITS_PER_PACKET:
-                            self._finalize_packet_delivery(pkt, cycle)
-                        moves += 1
-                        ejected += 1
             self._service_protocol_ejection_queues(cycle, self._routing_rng)
             self._print_drain_debug(
                 cycle,
@@ -2179,12 +2407,14 @@ class InterposerMesh:
         # ── Phase 2a: synchronized DRAIN circulation for escape VCs ───────
         drain_this_cycle = self._drain_active()
         if drain_this_cycle and self._drain_mode == DRAIN_MODE_DRAIN:
-            moves += self._perform_regular_drain_hop(cycle)
+            hop_moves = self._perform_regular_drain_hop(cycle)
+            ejected = self._perform_drain_ejection_stage(cycle)
+            moves += hop_moves + ejected
             self._drain_hops_remaining -= 1
             if STRICT_REGULAR_DRAIN:
                 self._print_drain_debug(
                     cycle,
-                    "strict_regular_drain: normal forwarding skipped",
+                    f"strict_regular_drain: hop_moves={hop_moves} ejected={ejected} normal forwarding skipped",
                     force=True,
                 )
                 self._service_protocol_ejection_queues(cycle, self._routing_rng)
@@ -3080,7 +3310,7 @@ def sweep_injection_rates(
     protocol_config:    Optional[ProtocolConfig] = None,
     num_seeds:          int   = 5,
     drain_period_c:     Optional[float] = 0.2,
-    drain_period_alpha: float           = 1.0,
+    drain_period_alpha: float           = 2.1,
 ) -> Dict[str, Dict[float, Dict[str, Any]]]:
     """
     Sweep CPU INJECTION_RATE and collect packet counts per scenario.
@@ -3118,7 +3348,7 @@ def sweep_injection_rates(
     total = len(rates)
     for idx, rate in enumerate(rates):
         effective_drain_period = (
-            max(1, round((drain_period_c / (rate ** drain_period_alpha))*2))
+            max(1, round((drain_period_c / (rate ** drain_period_alpha))))
             if drain_period_c is not None and stagger_drain == 1
             else drain_period
         )
@@ -4245,6 +4475,44 @@ def write_injection_sweep_summary_text(
     print(f"  Saved: {out_file}")
 
 
+def write_drain_turn_table_text(
+    mesh: InterposerMesh,
+    out_file: str = "drain_turn_table.txt",
+) -> None:
+    """Write the static per-port DRAIN turn-table to a text file."""
+    lines: List[str] = []
+    lines.append("Per-Port DRAIN Turn Table")
+    lines.append("=" * 72)
+    lines.append(
+        "Static table: built once at mesh construction and reused for every DRAIN window."
+    )
+    lines.append(f"entries={len(mesh._drain_turn_cycle)}")
+    lines.append("")
+
+    if not mesh._drain_turn_cycle:
+        lines.append("DRAIN disabled: no turn-table present.")
+    else:
+        lines.append(
+            "idx  src_router  src_in  out  dst_router  dst_in  successor_key"
+        )
+        lines.append("-" * 72)
+        for idx, binding in enumerate(mesh._drain_turn_cycle):
+            successor = mesh._drain_turn_cycle[(idx + 1) % len(mesh._drain_turn_cycle)]
+            lines.append(
+                f"{idx:>3}  "
+                f"{binding.src_router:<9}  "
+                f"{binding.src_input_port:<6}  "
+                f"{binding.out_dir:<3}  "
+                f"{binding.dst_router:<9}  "
+                f"{binding.dst_input_port:<6}  "
+                f"({successor.src_router},{successor.src_input_port})"
+            )
+
+    with open(out_file, "w", encoding="ascii") as handle:
+        handle.write("\n".join(lines).rstrip() + "\n")
+    print(f"  Saved: {out_file}")
+
+
 def plot_message_class_sweep(
     sweep: Dict[str, Dict[float, Dict[str, Any]]],
     scenario_label: str = "random_adaptive_with_drain",
@@ -4390,9 +4658,10 @@ def sweep_fault_count(
       - ``random_adaptive_with_drain``      (escape-VC + periodic DRAIN windows)
       - ``random_adaptive_turn_restricted`` (West-First turn-restricted routing)
 
-    After each fault set is placed, the drain Hamiltonian cycle is recomputed
-    on the surviving topology so DRAIN windows can still make progress wherever
-    connectivity allows.  Adaptive routing automatically avoids severed links.
+    Fault sweeps remain supported for non-DRAIN scenarios.  The current
+    per-port DRAIN implementation is intentionally limited to the standard
+    fault-free 4x4 mesh, so DRAIN-enabled fault sweeps with nonzero faults
+    raise an explicit unsupported-topology error.
 
     Parameters
     ----------
@@ -4611,14 +4880,14 @@ if __name__ == "__main__":
     #             print(f"    {chiplet_name}: {injected_by_chiplet[chiplet_name]}")
     #     print(f"  {det.summary()}")
 
-    out_prefix = "outputs/injection_rate_sweep"
+    out_prefix = "outputs/ijr"
     print("Sweeping INJECTION_RATE from 0.05 to 0.50 (step 0.025, averaged over 5 seeds) ...")
     sweep = sweep_injection_rates(
         chiplet_specs=specs,
         cycles=20000,
         rate_min=0.001,
-        rate_max=0.033, #0.031,
-        rate_step=0.008,
+        rate_max=0.026, #0.031,
+        rate_step=0.005,
         seed=42, # 42,
         routing_seed=0,
         num_seeds=4,
@@ -4640,6 +4909,17 @@ if __name__ == "__main__":
     write_injection_sweep_summary_text(
         sweep,
         out_file=text_out_file,
+    )
+    drain_table_out_file = f"{out_prefix}_drain_turn_table.txt"
+    drain_table_mesh = InterposerMesh(
+        chiplet_specs=specs,
+        routing_mode=ROUTING_RANDOM_ADAPTIVE,
+        routing_seed=0,
+        drain_enabled=True,
+    )
+    write_drain_turn_table_text(
+        drain_table_mesh,
+        out_file=drain_table_out_file,
     )
     
     plot_message_class_sweep(sweep, scenario_label = "random_adaptive_with_drain", out_prefix = out_prefix, show=False)
