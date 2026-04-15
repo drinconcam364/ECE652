@@ -1,7 +1,4 @@
-#Interpreter Path: /Users/danilorincon04/venvs/mnist/bin/python
-#Activate virtual env source ~/venvs/mnist/bin/activate
 """
-chiplet_interchiplet_sim.py
 ---------------------------
 Foundation classes for simulating inter-chiplet packet communication on a
 4×4 interposer mesh.
@@ -79,21 +76,9 @@ GPU_QUIET_CYCLES     = 80              # quiet cycles between bursts
 # ─── Routing algorithm identifiers ────────────────────────────────────────────
 
 ROUTING_XY               = "XY"
-# Traverse columns (X) first, then rows (Y).  Deadlock-free.
-
 ROUTING_YX               = "YX"
-# Traverse rows (Y) first, then columns (X).  Deadlock-free.
-
 ROUTING_RANDOM_ADAPTIVE  = "RANDOM_ADAPTIVE"
-# At each hop randomly choose among ALL directions that reduce Manhattan
-# distance to the destination (fully adaptive, minimal paths only).
-# NOT deadlock-free: cyclic channel dependencies can form under load.
-
 ROUTING_RANDOM_ADAPTIVE_TR = "RANDOM_ADAPTIVE_TR"
-# Hybrid mode:
-# - Normal VCs use fully random adaptive minimal routing.
-# - Escape VC uses turn-restricted adaptive routing (West-First).
-# - Packets may enter escape VC probabilistically and cannot return.
 
 DRAIN_MODE_NORMAL = "NORMAL"
 DRAIN_MODE_PRE_DRAIN = "PRE_DRAIN"
@@ -121,11 +106,10 @@ PROTOCOL_SERVICE_ORDER: Tuple[str, ...] = (
     MESSAGE_CLASS_CTRL,
 )
 
-# Top-level switch for legacy vs protocol traffic generation.
-# False = legacy single-class traffic, True = REQ->RESP protocol traffic.
+# False = legacy single-class traffic, True = REQ->RESP protocol traffic
 PROTOCOL_MODE_ENABLED = True
 
-## iffy --
+# Protocol queue capacities and outstanding limits 
 PROTOCOL_INJECTION_QUEUE_CAPACITY_PER_CLASS = 32
 PROTOCOL_EJECTION_QUEUE_CAPACITY_PER_CLASS = 32
 PROTOCOL_OUTSTANDING_LIMIT_PER_CLASS: Dict[str, int] = {
@@ -2762,10 +2746,6 @@ class InterposerMesh:
 @dataclass
 class DeadlockReport:
     """
-    Result of one deadlock detection check.
-
-    detected        True if a deadlock was identified this cycle.
-    cycle           The simulation cycle at which the check was made.
     method          Which method triggered the report:
                       "wait_for_cycle"  – a cycle was found in the wait-for graph
                       "none"            – no deadlock detected
@@ -3092,10 +3072,6 @@ class DeadlockDetector:
         #     )
         return "\n".join(lines)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Quick smoke-test
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def run_simulation(
