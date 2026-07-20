@@ -31,6 +31,8 @@ The simulated baseline is an accelerated processing unit (APU) composed of:
 
 Each interposer router has 5 input/output ports (`NORTH`, `SOUTH`, `EAST`, `WEST`, `DOWN`), where `DOWN` connects to a chiplet's boundary router. Each input port holds a configurable number of normal VCs plus exactly one escape VC (8-flit capacity each), with wormhole flow control (4 flits/packet) and a max of 1 flit per output port per cycle.
 
+<img src="outputs/APU.png" width="400">
+
 ## Features
 
 - **Wormhole flow control** with explicit header/body/tail flit modeling, including correct handling of **flit separation during DRAIN** (upstream flits promoted into newly routable heads when a drain event moves them off the original downstream path).
@@ -54,10 +56,13 @@ Each interposer router has 5 input/output ports (`NORTH`, `SOUTH`, `EAST`, `WEST
 ## Results Summary
 
 - **Deadlock removal:** Without DRAIN, random adaptive routing saturates around 1400 packets injected, with a growing share of failed/undelivered packets once injection rate exceeds ~0.005 packets/cycle/chiplet — clear evidence of deadlock. With DRAIN, injected packets equal delivered packets, and delivery scales linearly with injection rate.
-<img src="drain_comparison.png" width="600">
+<img src="outputs/drain_comparison.png" width="600">
 - **Throughput under load:** DRAIN saturates around 0.07 packets/cycle/chiplet, well beyond YX (~0.02) and Turn Restrictions (~0.03), because it preserves full adaptive routing flexibility in the common case and only pays a recovery cost during scheduled drain windows.
+<img src="outputs/all_compare.png" width="600">
 - **Transaction completion:** At an injection rate of 0.016 packets/cycle/chiplet, DRAIN completed 1439 transactions at a 99.06% completion rate, versus 81.41% (XY), 77.37% (YX), 80.10% (turn-restricted), and 71.34% (adaptive, no DRAIN).
+<img src="outputs/ijr_transaction_completion_all_scenarios.png" width="600">
 - **Fault tolerance:** A single faulty interposer link degrades Turn Restrictions' delivered packets by ~80%. DRAIN degrades far more gracefully, not reaching an 80% reduction until around 8 faulty links.
+<img src="outputs/fault_compare.png" width="600">
 - **Cost:** These gains come with a real latency penalty — periodic forced movement, escape-domain transitions, and worm fragmentation increase packet residence time even as throughput and completion improve. DRAIN is best understood as a **throughput- and completion-oriented** deadlock recovery mechanism, not a latency-minimizing one.
 
 ## Assumptions & Scope
