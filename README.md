@@ -54,7 +54,7 @@ Each interposer router has 5 input/output ports (`NORTH`, `SOUTH`, `EAST`, `WEST
 ## Results Summary
 
 - **Deadlock removal:** Without DRAIN, random adaptive routing saturates around 1400 packets injected, with a growing share of failed/undelivered packets once injection rate exceeds ~0.005 packets/cycle/chiplet — clear evidence of deadlock. With DRAIN, injected packets equal delivered packets, and delivery scales linearly with injection rate.
-![Random Adaptive with and without DRAIN](outputs/injection_rate_sweep_random_adaptive_comparison (1).png)
+![Random Adaptive with and without DRAIN](outputs/drain_comparison.png)
 - **Throughput under load:** DRAIN saturates around 0.07 packets/cycle/chiplet, well beyond YX (~0.02) and Turn Restrictions (~0.03), because it preserves full adaptive routing flexibility in the common case and only pays a recovery cost during scheduled drain windows.
 - **Transaction completion:** At an injection rate of 0.016 packets/cycle/chiplet, DRAIN completed 1439 transactions at a 99.06% completion rate, versus 81.41% (XY), 77.37% (YX), 80.10% (turn-restricted), and 71.34% (adaptive, no DRAIN).
 - **Fault tolerance:** A single faulty interposer link degrades Turn Restrictions' delivered packets by ~80%. DRAIN degrades far more gracefully, not reaching an 80% reduction until around 8 faulty links.
